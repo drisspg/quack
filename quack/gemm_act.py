@@ -46,6 +46,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -58,6 +59,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         epi_postact_smem_layout_staged: cute.ComposedLayout
         epi_tile_postact: cute.Tile
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -100,6 +102,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             args.act_fn,
+            args.tensor_epilogue_fn,
             alpha=args.alpha,
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
@@ -305,9 +308,12 @@ class GemmActMixin(GemmDefaultEpiMixin):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
-        # Apply activation function if provided
-        # If we don't have .shape here, the compiler generates local stores and loads
-        if const_expr(params.act_fn is not None):
+        if const_expr(params.tensor_epilogue_fn is not None):
+            tRS_rEpilogueIn = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+            tRS_rEpilogueIn.store(tRS_rD.load())
+            tRS_rPostAct = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+            tRS_rPostAct.store(params.tensor_epilogue_fn(tRS_rEpilogueIn.load()))
+        elif const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
@@ -385,6 +391,7 @@ class GemmGatedMixin(GemmActMixin):
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             args.act_fn,
+            args.tensor_epilogue_fn,
             alpha=args.alpha,
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
@@ -461,6 +468,8 @@ def _compile_gemm_act(
     persistent,
     has_semaphore,
     activation,
+    tensor_epilogue_fn,
+    tensor_epilogue_key,
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
@@ -501,10 +510,13 @@ def _compile_gemm_act(
     else:
         mColVec = None
 
-    act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+    act_fn = None if tensor_epilogue_fn is not None else (
+        act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+    )
     epi_args = GemmCls.EpilogueArguments(
         mPostAct,
         act_fn,
+        tensor_epilogue_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
     )
@@ -529,6 +541,7 @@ def _compile_gemm_act(
         persistent,
         has_semaphore,
         activation,
+        tensor_epilogue_key,
         rowvec_dtype,
         colvec_dtype,
         colvec_ndim,
@@ -577,8 +590,13 @@ def gemm_act(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    tensor_epilogue_fn: Optional[Callable] = None,
+    tensor_epilogue_key: Optional[str] = None,
 ) -> None:
-    if activation in gate_fn_map:
+    if tensor_epilogue_fn is not None:
+        assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
+        gemm_cls_name = "act"
+    elif activation in gate_fn_map:
         gemm_cls_name = "gated"
     else:
         assert activation in act_fn_map, f"Unsupported activation {activation}"
@@ -635,6 +653,8 @@ def gemm_act(
         persistent,
         tile_count_semaphore is not None,
         activation,
+        tensor_epilogue_fn,
+        tensor_epilogue_key if tensor_epilogue_key is not None else repr(tensor_epilogue_fn),
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
@@ -652,7 +672,8 @@ def gemm_act(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
-        None,  # act_fn is Constexpr, pass None at call time
+        None,
+        None,
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
     )
