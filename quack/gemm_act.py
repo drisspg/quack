@@ -358,6 +358,8 @@ def _compile_gemm_act(
     activation,
     tensor_epilogue_fn,
     tensor_epilogue_key,
+    alpha_mode,
+    beta_mode,
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
@@ -430,6 +432,8 @@ def _compile_gemm_act(
         mAuxOut,
         act_fn,
         tensor_epilogue_fn,
+        alpha=fake_scalar(alpha_mode, Float32),
+        beta=fake_scalar(beta_mode, Float32),
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
         rounding_mode=rounding_mode,
@@ -488,6 +492,8 @@ def gemm_act(
     concat_layout: tuple | None = None,
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> None:
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
@@ -544,6 +550,8 @@ def gemm_act(
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
+    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
+    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
     concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
     compiled_fn = _compile_gemm_act(
         a_dtype,
@@ -564,6 +572,8 @@ def gemm_act(
         activation,
         tensor_epilogue_fn,
         tensor_epilogue_key if tensor_epilogue_key is not None else repr(tensor_epilogue_fn),
+        alpha_mode,
+        beta_mode,
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
@@ -596,6 +606,8 @@ def gemm_act(
         PostAct_p,
         None,
         None,
+        alpha=scalar_arg(alpha, alpha_mode, Float32),
+        beta=scalar_arg(beta, beta_mode, Float32),
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
         rounding_mode=None,  # Constexpr, pass None at call time

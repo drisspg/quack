@@ -340,6 +340,8 @@ def gemm_act_tuned(
     config: Optional[GemmConfig] = None,
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -393,6 +395,8 @@ def gemm_act_tuned(
         use_tma_gather=config.use_tma_gather,
         tensor_epilogue_fn=tensor_epilogue_fn,
         tensor_epilogue_key=tensor_epilogue_key,
+        alpha=alpha,
+        beta=beta,
     )
 
 
@@ -993,6 +997,8 @@ def gemm_act(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     if tensor_epilogue_fn is not None:
@@ -1037,6 +1043,8 @@ def gemm_act(
             dynamic_scheduler,
             tensor_epilogue_fn=tensor_epilogue_fn,
             tensor_epilogue_key=tensor_epilogue_key,
+            alpha=alpha,
+            beta=beta,
         )
     elif is_gated:
         gemm_gated_out(

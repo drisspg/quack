@@ -23,9 +23,9 @@ def gemm_epilogue(
         tuned=False,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
+        alpha=alpha,
+        beta=beta,
     )
-    if alpha != 1.0 or beta != 1.0:
-        raise NotImplementedError("gemm_epilogue scalar alpha/beta is not wired yet")
     return out
 
 
