@@ -54,12 +54,16 @@ class GemmActMixin(ComposableEpiMixin):
         ColVecLoad("mColVecBroadcast"),
         TileStore("mAuxOut"),
     )
-    _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
+    _extra_param_fields = (
+        ("act_fn", cutlass.Constexpr, None),
+        ("tensor_epilogue_fn", cutlass.Constexpr, None),
+    )
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mAuxOut: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -76,6 +80,7 @@ class GemmActMixin(ComposableEpiMixin):
         self.cta_tile_shape_aux_out_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
+        d["tensor_epilogue_fn"] = args.tensor_epilogue_fn
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d and d[key] is not None:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
@@ -166,9 +171,12 @@ class GemmActMixin(ComposableEpiMixin):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
-        # Apply activation function if provided
-        # If we don't have .shape here, the compiler generates local stores and loads
-        if const_expr(params.act_fn is not None):
+        if const_expr(params.tensor_epilogue_fn is not None):
+            tRS_rEpilogueIn = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+            tRS_rEpilogueIn.store(tRS_rD.load())
+            tRS_rAuxOut = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+            tRS_rAuxOut.store(params.tensor_epilogue_fn(tRS_rEpilogueIn.load()))
+        elif const_expr(params.act_fn is not None):
             tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch != 100):
                 for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
@@ -348,6 +356,8 @@ def _compile_gemm_act(
     persistent,
     is_dynamic_persistent,
     activation,
+    tensor_epilogue_fn,
+    tensor_epilogue_key,
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
@@ -404,7 +414,9 @@ def _compile_gemm_act(
     else:
         mColVec = None
 
-    act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+    act_fn = None if tensor_epilogue_fn is not None else (
+        act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+    )
 
     def fake_scalar(mode, dtype=Int32):
         if mode == 0:
@@ -417,6 +429,7 @@ def _compile_gemm_act(
     epi_args = GemmCls.EpilogueArguments(
         mAuxOut,
         act_fn,
+        tensor_epilogue_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
         rounding_mode=rounding_mode,
@@ -473,8 +486,13 @@ def gemm_act(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: tuple | None = None,
+    tensor_epilogue_fn: Optional[Callable] = None,
+    tensor_epilogue_key: Optional[str] = None,
 ) -> None:
-    if activation in gate_fn_map:
+    if tensor_epilogue_fn is not None:
+        assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
+        gemm_cls_name = "act"
+    elif activation in gate_fn_map:
         gemm_cls_name = "gated"
     else:
         assert activation in act_fn_map, f"Unsupported activation {activation}"
@@ -544,6 +562,8 @@ def gemm_act(
         persistent,
         is_dynamic_persistent,
         activation,
+        tensor_epilogue_fn,
+        tensor_epilogue_key if tensor_epilogue_key is not None else repr(tensor_epilogue_fn),
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
@@ -574,7 +594,8 @@ def gemm_act(
 
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
-        None,  # act_fn is Constexpr, pass None at call time
+        None,
+        None,
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
         rounding_mode=None,  # Constexpr, pass None at call time

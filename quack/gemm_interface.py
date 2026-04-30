@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Optional, Tuple, Literal
+from typing import Callable, Optional, Tuple, Literal
 from functools import partial
 
 import torch
@@ -338,6 +338,8 @@ def gemm_act_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
+    tensor_epilogue_fn: Optional[Callable] = None,
+    tensor_epilogue_key: Optional[str] = None,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -389,6 +391,8 @@ def gemm_act_tuned(
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
+        tensor_epilogue_fn=tensor_epilogue_fn,
+        tensor_epilogue_key=tensor_epilogue_key,
     )
 
 
@@ -987,8 +991,12 @@ def gemm_act(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    tensor_epilogue_fn: Optional[Callable] = None,
+    tensor_epilogue_key: Optional[str] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
+    if tensor_epilogue_fn is not None:
+        assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
@@ -1015,7 +1023,22 @@ def gemm_act(
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
-    if is_gated:
+    if tensor_epilogue_fn is not None:
+        partial(gemm_act_tuned.fn, config=None)(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            bias,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tensor_epilogue_fn=tensor_epilogue_fn,
+            tensor_epilogue_key=tensor_epilogue_key,
+        )
+    elif is_gated:
         gemm_gated_out(
             A,
             B,
