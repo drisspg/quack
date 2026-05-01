@@ -335,23 +335,27 @@ def gemm_act_tuned(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    tensor_epilogue_uses_c: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
+    varlen_k = cu_seqlens_k is not None
+    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not varlen_m:
+    if A.ndim == 2 and not (varlen_m or varlen_k):
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
+    B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
+    if B.ndim == 2 and not varlen_k:
         B = B.unsqueeze(0)  # (1, N, K)
     if C is not None and C.ndim == 2 and not varlen_m:
         C = C.unsqueeze(0)  # (1, M, N)
@@ -391,10 +395,12 @@ def gemm_act_tuned(
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
         tensor_epilogue_fn=tensor_epilogue_fn,
         tensor_epilogue_key=tensor_epilogue_key,
+        tensor_epilogue_uses_c=tensor_epilogue_uses_c,
         alpha=alpha,
         beta=beta,
     )
@@ -990,13 +996,15 @@ def gemm_act(
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    tensor_epilogue_uses_c: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
@@ -1007,10 +1015,14 @@ def gemm_act(
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
+    varlen_k = cu_seqlens_k is not None
+    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
         out_shape = (total_m, B.shape[-1])
+    elif varlen_k:
+        out_shape = (cu_seqlens_k.shape[0] - 1, A.shape[0], B.shape[-1])
     elif A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
     else:
@@ -1039,10 +1051,12 @@ def gemm_act(
             bias,
             activation,
             cu_seqlens_m,
+            cu_seqlens_k,
             A_idx,
             dynamic_scheduler,
             tensor_epilogue_fn=tensor_epilogue_fn,
             tensor_epilogue_key=tensor_epilogue_key,
+            tensor_epilogue_uses_c=tensor_epilogue_uses_c,
             alpha=alpha,
             beta=beta,
         )
@@ -1102,7 +1116,19 @@ def gemm_act_out(
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    fn(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias,
+        activation,
+        cu_seqlens_m,
+        None,
+        A_idx,
+        dynamic_scheduler,
+    )
 
 
 def gemm_act_ref(
