@@ -46,8 +46,10 @@ def _empty_k_matmul_into(
 
 
 def _force_local_reduce_config(config: GemmConfig, group: int) -> GemmConfig:
-    if group != 32:
-        raise NotImplementedError("local N-group reduce MVP only supports group=32")
+    if group <= 0 or group & (group - 1) != 0:
+        raise NotImplementedError(
+            f"local N-group reduce currently requires a positive power-of-two group, got {group}"
+        )
     if config.swap_ab:
         raise NotImplementedError("local N-group reduce does not support swap_ab")
     return replace(config, tile_n=group, cluster_n=1, swap_ab=False)

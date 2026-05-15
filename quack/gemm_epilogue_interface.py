@@ -27,8 +27,10 @@ def _validate_local_reduce(
     if out is None:
         return None
     group = 32 if group is None else group
-    if group != 32:
-        raise NotImplementedError("QUACK local_reduce_out MVP only supports group=32")
+    if group <= 0 or group & (group - 1) != 0:
+        raise NotImplementedError(
+            f"QUACK local_reduce_out currently requires a positive power-of-two group, got {group}"
+        )
     n = b.shape[-1]
     if n % group != 0:
         raise RuntimeError(f"local_reduce_out requires N divisible by {group}, got N={n}")
