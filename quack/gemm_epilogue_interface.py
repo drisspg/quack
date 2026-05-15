@@ -7,6 +7,20 @@ from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
 from quack.gemm_interface import gemm_act
 
 
+def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
+    m, n = a.shape[-2], b.shape[-1]
+    if arg.shape == (m, n):
+        return "tile"
+    if arg.shape == (1, n):
+        return "row"
+    if arg.shape == (m, 1):
+        return "col"
+    raise NotImplementedError(
+        "QUACK captured tensor epilogue args currently must match the GEMM output "
+        "shape or broadcast as [1, N] / [M, 1]"
+    )
+
+
 def gemm_epilogue(
     a: Tensor,
     b: Tensor,
@@ -51,14 +65,16 @@ def gemm_epilogue(
             out_dtype=a.dtype if out_dtype is None else out_dtype,
         )
         return out
-    if epilogue_arg_kinds and epilogue_arg_kinds != ("tile",):
+    if epilogue_args and len(epilogue_args) != 1:
+        raise RuntimeError("QUACK epilogue requires exactly one epilogue arg")
+    if epilogue_arg_kinds and epilogue_arg_kinds not in (("tile",), ("row",), ("col",)):
         raise NotImplementedError(
-            f"QUACK GEMM epilogue supports only one full-tile aux tensor for now, got {epilogue_arg_kinds}"
+            f"QUACK GEMM epilogue supports only one tile/row/col aux tensor for now, got {epilogue_arg_kinds}"
         )
-    if epilogue_arg_kinds and len(epilogue_args) != 1:
-        raise RuntimeError("full-tile QUACK epilogue requires exactly one epilogue arg")
-    if epilogue_arg_kinds and C is not None:
-        raise NotImplementedError("full-tile QUACK epilogue arg cannot be combined with C yet")
+    if epilogue_arg_kinds and not epilogue_args:
+        raise RuntimeError("epilogue_arg_kinds requires an epilogue arg")
+    if epilogue_args and C is not None:
+        raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
     if scale_a is not None or scale_b is not None:
         if scale_a is None or scale_b is None:
             raise RuntimeError("scaled GEMM epilogue requires both scale_a and scale_b")
@@ -73,16 +89,30 @@ def gemm_epilogue(
             epilogue_key,
             out_dtype=a.dtype if out_dtype is None else out_dtype,
         )
+    epilogue_arg = epilogue_args[0] if epilogue_args else None
+    if epilogue_arg is not None:
+        inferred_kind = _infer_epilogue_arg_kind(a, b, epilogue_arg)
+        if epilogue_arg_kinds and epilogue_arg_kinds != (inferred_kind,):
+            raise RuntimeError(
+                f"epilogue_arg_kinds={epilogue_arg_kinds} does not match inferred kind {inferred_kind!r}"
+            )
+        epilogue_arg_kind = inferred_kind
+    else:
+        epilogue_arg_kind = None
+    row_aux = epilogue_arg.squeeze(0) if epilogue_arg_kind == "row" else None
+    col_aux = epilogue_arg.squeeze(-1) if epilogue_arg_kind == "col" else None
     _, out = gemm_act(
         a,
         b,
-        C=epilogue_args[0] if epilogue_arg_kinds else C,
+        C=epilogue_arg if epilogue_arg_kind == "tile" else C,
+        bias=row_aux,
+        colvec_bias=col_aux,
         activation=None,
         store_preact=False,
         tuned=False,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
-        tensor_epilogue_uses_c=bool(epilogue_arg_kinds),
+        tensor_epilogue_uses_c=epilogue_arg is not None,
         alpha=alpha,
         beta=beta,
     )

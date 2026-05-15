@@ -181,10 +181,17 @@ class GemmActMixin(ComposableEpiMixin):
             tRS_rEpilogueIn.store(tRS_rD.load())
             tRS_rAuxOut = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
             if const_expr(params.tensor_epilogue_uses_c):
-                tRS_rEpilogueC = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
-                tRS_rEpilogueC.store(tRS_rC.load().to(self.acc_dtype))
+                tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
+                tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+                tRS_rEpilogueAux = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+                if const_expr(tRS_rC is not None):
+                    tRS_rEpilogueAux.store(tRS_rC.load().to(self.acc_dtype))
+                elif const_expr(tDrRowVec is not None):
+                    tRS_rEpilogueAux.store(tDrRowVec.load().to(self.acc_dtype))
+                else:
+                    tRS_rEpilogueAux.store(tDrColVec.load().to(self.acc_dtype))
                 tRS_rAuxOut.store(
-                    params.tensor_epilogue_fn(tRS_rEpilogueIn.load(), tRS_rEpilogueC.load())
+                    params.tensor_epilogue_fn(tRS_rEpilogueIn.load(), tRS_rEpilogueAux.load())
                 )
             else:
                 tRS_rAuxOut.store(params.tensor_epilogue_fn(tRS_rEpilogueIn.load()))

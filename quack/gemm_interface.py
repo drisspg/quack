@@ -344,6 +344,7 @@ def gemm_act_tuned(
     tensor_epilogue_uses_c: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    colvec_bias: Optional[Tensor] = None,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -369,6 +370,8 @@ def gemm_act_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
+    if colvec_bias is not None and colvec_bias.ndim == 1:
+        colvec_bias = colvec_bias.unsqueeze(0)  # (L, M)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -392,8 +395,8 @@ def gemm_act_tuned(
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
-        rowvec_bias=bias if not config.swap_ab else None,
-        colvec_bias=bias if config.swap_ab else None,
+        rowvec_bias=bias if not config.swap_ab else colvec_bias,
+        colvec_bias=colvec_bias if not config.swap_ab else bias,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
@@ -1007,6 +1010,7 @@ def gemm_act(
     tensor_epilogue_uses_c: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    colvec_bias: Optional[Tensor] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     if tensor_epilogue_fn is not None:
@@ -1059,6 +1063,7 @@ def gemm_act(
             tensor_epilogue_uses_c=tensor_epilogue_uses_c,
             alpha=alpha,
             beta=beta,
+            colvec_bias=colvec_bias,
         )
     elif is_gated:
         gemm_gated_out(
