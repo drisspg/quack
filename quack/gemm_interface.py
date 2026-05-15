@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao
 from typing import Callable, Optional, Tuple, Literal
+from dataclasses import replace
 from functools import partial
 
 import torch
@@ -42,6 +43,14 @@ def _empty_k_matmul_into(
         out.zero_()
     if bias is not None:
         out += bias
+
+
+def _force_local_reduce_config(config: GemmConfig, group: int) -> GemmConfig:
+    if group != 32:
+        raise NotImplementedError("local N-group reduce MVP only supports group=32")
+    if config.swap_ab:
+        raise NotImplementedError("local N-group reduce does not support swap_ab")
+    return replace(config, tile_n=group, cluster_n=1, swap_ab=False)
 
 
 def _silu_tanh(x: Tensor) -> Tensor:
@@ -345,9 +354,15 @@ def gemm_act_tuned(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     colvec_bias: Optional[Tensor] = None,
+    local_reduce_out: Optional[Tensor] = None,
+    local_reduce_group: int | None = None,
+    local_reduce_feeds_main: bool = False,
 ) -> None:
     if config is None:
         config = default_config(A.device)
+    if local_reduce_out is not None:
+        local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
+        config = _force_local_reduce_config(config, local_reduce_group)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
@@ -372,6 +387,11 @@ def gemm_act_tuned(
         bias = bias.unsqueeze(0)  # (L, N)
     if colvec_bias is not None and colvec_bias.ndim == 1:
         colvec_bias = colvec_bias.unsqueeze(0)  # (L, M)
+    if local_reduce_out is not None:
+        if varlen_m:
+            raise NotImplementedError("local_reduce_out with varlen_m is not supported yet")
+        if local_reduce_out.ndim == 2:
+            local_reduce_out = local_reduce_out.unsqueeze(0)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -406,6 +426,8 @@ def gemm_act_tuned(
         tensor_epilogue_uses_c=tensor_epilogue_uses_c,
         alpha=alpha,
         beta=beta,
+        local_reduce_out=local_reduce_out,
+        local_reduce_feeds_main=local_reduce_feeds_main,
     )
 
 
@@ -1011,6 +1033,9 @@ def gemm_act(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     colvec_bias: Optional[Tensor] = None,
+    local_reduce_out: Optional[Tensor] = None,
+    local_reduce_group: int | None = None,
+    local_reduce_feeds_main: bool = False,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     if tensor_epilogue_fn is not None:
@@ -1043,6 +1068,8 @@ def gemm_act(
         if preact_out is not None:
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)
+        if local_reduce_out is not None:
+            local_reduce_out.zero_()
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
     if tensor_epilogue_fn is not None:
@@ -1064,6 +1091,9 @@ def gemm_act(
             alpha=alpha,
             beta=beta,
             colvec_bias=colvec_bias,
+            local_reduce_out=local_reduce_out,
+            local_reduce_group=local_reduce_group,
+            local_reduce_feeds_main=local_reduce_feeds_main,
         )
     elif is_gated:
         gemm_gated_out(

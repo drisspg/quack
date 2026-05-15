@@ -21,6 +21,23 @@ def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
     )
 
 
+def _validate_local_reduce(
+    a: Tensor, b: Tensor, out: Tensor | None, group: int | None
+) -> int | None:
+    if out is None:
+        return None
+    group = 32 if group is None else group
+    if group != 32:
+        raise NotImplementedError("QUACK local_reduce_out MVP only supports group=32")
+    n = b.shape[-1]
+    if n % group != 0:
+        raise RuntimeError(f"local_reduce_out requires N divisible by {group}, got N={n}")
+    expected = (*a.shape[:-1], n // group)
+    if tuple(out.shape) != tuple(expected):
+        raise RuntimeError(f"local_reduce_out shape must be {expected}, got {tuple(out.shape)}")
+    return group
+
+
 def gemm_epilogue(
     a: Tensor,
     b: Tensor,
@@ -35,8 +52,14 @@ def gemm_epilogue(
     offs: Tensor | None = None,
     epilogue_args: tuple[Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
+    local_reduce_out: Tensor | None = None,
+    local_reduce_group: int | None = None,
+    local_reduce_feeds_main: bool = False,
 ) -> Tensor:
+    local_reduce_group = _validate_local_reduce(a, b, local_reduce_out, local_reduce_group)
     if offs is not None:
+        if local_reduce_out is not None:
+            raise NotImplementedError("grouped GEMM epilogue local_reduce_out is not supported yet")
         if C is not None or scale_a is not None or scale_b is not None or alpha != 1.0 or beta != 1.0:
             raise NotImplementedError("QUACK grouped GEMM epilogue does not support C/scales/alpha/beta yet")
         if offs.dtype is not torch.int32:
@@ -76,6 +99,8 @@ def gemm_epilogue(
     if epilogue_args and C is not None:
         raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
     if scale_a is not None or scale_b is not None:
+        if local_reduce_out is not None:
+            raise NotImplementedError("scaled GEMM epilogue local_reduce_out is not supported yet")
         if scale_a is None or scale_b is None:
             raise RuntimeError("scaled GEMM epilogue requires both scale_a and scale_b")
         if C is not None or alpha != 1.0 or beta != 1.0:
@@ -115,6 +140,10 @@ def gemm_epilogue(
         tensor_epilogue_uses_c=epilogue_arg is not None,
         alpha=alpha,
         beta=beta,
+        out_dtype=a.dtype if out_dtype is None else out_dtype,
+        local_reduce_out=local_reduce_out,
+        local_reduce_group=local_reduce_group,
+        local_reduce_feeds_main=local_reduce_feeds_main,
     )
     return out
 
