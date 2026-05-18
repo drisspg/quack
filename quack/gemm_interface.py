@@ -61,6 +61,10 @@ def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> Gemm
         return replace(config, tile_n=tile_n, cluster_n=1, swap_ab=False)
     if dim == 0:
         tile_m = 128
+        if group > 16:
+            raise NotImplementedError(
+                "local M-group reductions currently support only group sizes <= 16"
+            )
         if tile_m % group != 0:
             raise NotImplementedError(
                 f"local M-group reduce requires tile_m divisible by group, got tile_m={tile_m}, group={group}"
@@ -408,6 +412,15 @@ def gemm_act_tuned(
     if local_reduce_out is not None:
         if varlen_m:
             raise NotImplementedError("local_reduce_out with varlen_m is not supported yet")
+        if local_reduce_dim == 0:
+            if local_reduce_feeds_main:
+                raise NotImplementedError(
+                    "local M-group reductions feeding the main output are not supported yet"
+                )
+            if A.shape[-2] % 128 != 0:
+                raise NotImplementedError(
+                    "local M-group reductions currently require M to be a multiple of tile_m=128"
+                )
         if local_reduce_out.ndim == 2:
             local_reduce_out = local_reduce_out.unsqueeze(0)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
