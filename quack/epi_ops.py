@@ -567,6 +567,16 @@ def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
 
 
 @cute.jit
+def grouped_colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None):
+    """Accumulate per-element values for grouped-N reductions."""
+    if const_expr(tDrReduce is not None):
+        if const_expr(transform_fn is None):
+            transform_fn = lambda x: x
+        for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+            tDrReduce[i] += transform_fn(tRS_rInput[i])
+
+
+@cute.jit
 def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
     """Accumulate transform_fn(input) or input * rScale into a RowVecReduce buffer.
 
@@ -677,6 +687,120 @@ class VecReduce(EpiOp):
             if const_expr(epi_coord[self._reduce_dim()] == 0):
                 cute.filter_zeros(result).fill(0.0)
         return result
+
+
+class GroupedColVecReduce(VecReduce):
+    """Column-vector reductions over contiguous N groups inside a CTA tile."""
+
+    dim = 0
+    epi_m_major_preference = -1
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        result = None
+        if const_expr(param is not None):
+            group_n = const_expr(gemm.local_reduce_group)
+            if const_expr(group_n == 0 or group_n == ctx.tile_N):
+                return ColVecReduce.begin(self, gemm, param, smem_tensor, ctx)
+            assert ctx.tile_N % group_n == 0
+            # Keep per-element accumulators; grouping happens at end_loop after we
+            # recover logical N coordinates from the same epilogue partition.
+            vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N))
+            tDrReduce_layout = ctx.partition_for_epilogue_fn(
+                cute.make_rmem_tensor(vec_mma_layout, Float32)
+            ).layout
+            tDrReduce = cute.make_rmem_tensor(tDrReduce_layout, Float32)
+            result = (tDrReduce, smem_tensor)
+        return result
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        result = None
+        if const_expr(state is not None):
+            group_n = const_expr(gemm.local_reduce_group)
+            if const_expr(group_n == 0 or group_n == gemm.cta_tile_shape_mnk[1]):
+                return ColVecReduce.begin_loop(self, gemm, state, epi_coord)
+            tDrReduce = state[0]
+            result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            cute.filter_zeros(result).fill(0.0)
+        return result
+
+    @cute.jit
+    def end_loop(
+        self,
+        gemm,
+        param,
+        state,
+        epi_coord,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        if const_expr(param is not None):
+            group_n = const_expr(gemm.local_reduce_group)
+            if const_expr(group_n == 0 or group_n == gemm.cta_tile_shape_mnk[1]):
+                return ColVecReduce.end_loop(
+                    self,
+                    gemm,
+                    param,
+                    state,
+                    epi_coord,
+                    epi_tile,
+                    tiled_copy_t2r,
+                    tiled_copy_r2s,
+                    tile_coord_mnkl,
+                    varlen_manager,
+                    tidx,
+                )
+            tDrReduce = state[0]
+            tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
+
+            partition_for_epilogue_fn = partial(
+                partition_for_epilogue,
+                epi_tile=epi_tile,
+                tiled_copy=tiled_copy,
+                tidx=tidx,
+                reference_src=reference_src,
+            )
+            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            groups_per_cta = const_expr(tile_N // group_n)
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
+            tDrReduce_flt = cute.filter_zeros(tDrReduce_cur)
+            tDcD_flt = cute.filter_zeros(tDcD_cur)
+
+            batch_idx = tile_coord_mnkl[3]
+            limit_m = min(
+                varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M,
+                tile_M,
+            )
+            limit_n_groups = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
+            if const_expr(not varlen_manager.varlen_m):
+                mColVec = param[batch_idx, None, None]
+            else:
+                mColVec = cute.domain_offset(
+                    (varlen_manager.params.cu_seqlens_m[batch_idx], None),
+                    param[None, None],
+                )
+            gColVec = cute.local_tile(
+                mColVec,
+                (tile_M, groups_per_cta),
+                (tile_coord_mnkl[0], tile_coord_mnkl[1]),
+            )
+            for i in cutlass.range(0, cute.size(tDrReduce_flt), group_n, unroll_full=True):
+                row_idx = tDcD_flt[i][0]
+                n_idx = tDcD_flt[i][1]
+                group_idx = n_idx // group_n
+                group_sum = tDrReduce_flt[i]
+                for j in cutlass.range_constexpr(1, group_n):
+                    group_sum += tDrReduce_flt[i + j]
+                if row_idx < limit_m and group_idx < limit_n_groups:
+                    gColVec[row_idx, group_idx] = group_sum
 
 
 class ColVecReduce(VecReduce):

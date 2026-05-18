@@ -52,7 +52,12 @@ def _force_local_reduce_config(config: GemmConfig, group: int) -> GemmConfig:
         )
     if config.swap_ab:
         raise NotImplementedError("local N-group reduce does not support swap_ab")
-    return replace(config, tile_n=group, cluster_n=1, swap_ab=False)
+    tile_n = max(32, group)
+    if tile_n % group != 0:
+        raise NotImplementedError(
+            f"local N-group reduce requires tile_n divisible by group, got tile_n={tile_n}, group={group}"
+        )
+    return replace(config, tile_n=tile_n, cluster_n=1, swap_ab=False)
 
 
 def _silu_tanh(x: Tensor) -> Tensor:
@@ -430,6 +435,7 @@ def gemm_act_tuned(
         beta=beta,
         local_reduce_out=local_reduce_out,
         local_reduce_feeds_main=local_reduce_feeds_main,
+        local_reduce_group=0 if local_reduce_group is None else local_reduce_group,
     )
 
 

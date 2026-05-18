@@ -22,11 +22,12 @@ from quack.cute_dsl_utils import (
 from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import (
     ColVecLoad,
-    ColVecReduce,
+    GroupedColVecReduce,
     RowVecLoad,
     Scalar,
     TileStore,
     colvec_reduce_accumulate,
+    grouped_colvec_reduce_accumulate,
 )
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
@@ -60,7 +61,7 @@ class GemmActMixin(ComposableEpiMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
-        ColVecReduce("mColVecReduce"),
+        GroupedColVecReduce("mColVecReduce"),
         TileStore("mAuxOut"),
     )
     _extra_param_fields = (
@@ -68,6 +69,7 @@ class GemmActMixin(ComposableEpiMixin):
         ("tensor_epilogue_fn", cutlass.Constexpr, None),
         ("tensor_epilogue_uses_c", cutlass.Constexpr, False),
         ("local_reduce_feeds_main", cutlass.Constexpr, False),
+        ("local_reduce_group", cutlass.Constexpr, 0),
     )
 
     @mlir_namedtuple
@@ -77,6 +79,7 @@ class GemmActMixin(ComposableEpiMixin):
         tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
         tensor_epilogue_uses_c: cutlass.Constexpr[bool] = False
         local_reduce_feeds_main: cutlass.Constexpr[bool] = False
+        local_reduce_group: cutlass.Constexpr[int] = 0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -97,6 +100,8 @@ class GemmActMixin(ComposableEpiMixin):
         d["tensor_epilogue_fn"] = args.tensor_epilogue_fn
         d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
         d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
+        d["local_reduce_group"] = args.local_reduce_group
+        self.local_reduce_group = args.local_reduce_group
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d and d[key] is not None:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
@@ -188,7 +193,10 @@ class GemmActMixin(ComposableEpiMixin):
     ) -> Optional[cute.Tensor]:
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
         if const_expr(tDrColVecReduce is not None):
-            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)
+            if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
+                grouped_colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)
+            else:
+                colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)
             if const_expr(params.local_reduce_feeds_main):
                 if const_expr(self.arch != 100):
                     for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
@@ -408,6 +416,7 @@ def _compile_gemm_act(
     local_reduce_dtype,
     local_reduce_ndim,
     local_reduce_feeds_main,
+    local_reduce_group,
     varlen_m,
     varlen_k,
     gather_A,
@@ -497,6 +506,7 @@ def _compile_gemm_act(
         tensor_epilogue_fn,
         tensor_epilogue_uses_c,
         local_reduce_feeds_main,
+        local_reduce_group,
         alpha=fake_scalar(alpha_mode, Float32),
         beta=fake_scalar(beta_mode, Float32),
         mRowVecBroadcast=mRowVec,
@@ -566,6 +576,7 @@ def gemm_act(
     beta: float | Tensor = 1.0,
     local_reduce_out: Optional[Tensor] = None,
     local_reduce_feeds_main: bool = False,
+    local_reduce_group: int = 0,
 ) -> None:
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
@@ -656,6 +667,7 @@ def gemm_act(
         torch2cute_dtype_map[local_reduce_out.dtype] if local_reduce_out is not None else None,
         local_reduce_ndim,
         local_reduce_feeds_main,
+        local_reduce_group,
         varlen_m,
         varlen_k,
         gather_A,
@@ -684,6 +696,7 @@ def gemm_act(
 
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
+        None,
         None,
         None,
         None,

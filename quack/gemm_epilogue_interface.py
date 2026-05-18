@@ -128,6 +128,7 @@ def gemm_epilogue(
         epilogue_arg_kind = None
     row_aux = epilogue_arg.squeeze(0) if epilogue_arg_kind == "row" else None
     col_aux = epilogue_arg.squeeze(-1) if epilogue_arg_kind == "col" else None
+    postact_dtype = a.dtype if out_dtype is None else out_dtype
     _, out = gemm_act(
         a,
         b,
@@ -142,7 +143,7 @@ def gemm_epilogue(
         tensor_epilogue_uses_c=epilogue_arg is not None,
         alpha=alpha,
         beta=beta,
-        out_dtype=a.dtype if out_dtype is None else out_dtype,
+        out_dtype=postact_dtype,
         local_reduce_out=local_reduce_out,
         local_reduce_group=local_reduce_group,
         local_reduce_feeds_main=local_reduce_feeds_main,
