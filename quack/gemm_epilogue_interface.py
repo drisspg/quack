@@ -22,7 +22,7 @@ def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
 
 
 def _validate_local_reduce(
-    a: Tensor, b: Tensor, out: Tensor | None, group: int | None
+    a: Tensor, b: Tensor, out: Tensor | None, group: int | None, dim: int | None
 ) -> int | None:
     if out is None:
         return None
@@ -31,10 +31,23 @@ def _validate_local_reduce(
         raise NotImplementedError(
             f"QUACK local_reduce_out currently requires a positive power-of-two group, got {group}"
         )
-    n = b.shape[-1]
-    if n % group != 0:
-        raise RuntimeError(f"local_reduce_out requires N divisible by {group}, got N={n}")
-    expected = (*a.shape[:-1], n // group)
+    dim = 1 if dim is None else dim
+    if dim == 1:
+        reduce_size = b.shape[-1]
+        expected = (*a.shape[:-1], reduce_size // group)
+    elif dim == 0:
+        reduce_size = a.shape[-2]
+        if reduce_size % 128 != 0:
+            raise NotImplementedError(
+                "local M-group reductions currently require M to be a multiple of tile_m=128"
+            )
+        expected = (*a.shape[:-2], reduce_size // group, b.shape[-1])
+    else:
+        raise NotImplementedError(f"unsupported local_reduce_dim={dim}")
+    if reduce_size % group != 0:
+        raise RuntimeError(
+            f"local_reduce_out requires reduced dim divisible by {group}, got {reduce_size}"
+        )
     if tuple(out.shape) != tuple(expected):
         raise RuntimeError(f"local_reduce_out shape must be {expected}, got {tuple(out.shape)}")
     return group
@@ -56,9 +69,12 @@ def gemm_epilogue(
     epilogue_arg_kinds: tuple[str, ...] = (),
     local_reduce_out: Tensor | None = None,
     local_reduce_group: int | None = None,
+    local_reduce_dim: int | None = None,
     local_reduce_feeds_main: bool = False,
 ) -> Tensor:
-    local_reduce_group = _validate_local_reduce(a, b, local_reduce_out, local_reduce_group)
+    local_reduce_group = _validate_local_reduce(
+        a, b, local_reduce_out, local_reduce_group, local_reduce_dim
+    )
     if offs is not None:
         if local_reduce_out is not None:
             raise NotImplementedError("grouped GEMM epilogue local_reduce_out is not supported yet")
@@ -146,6 +162,7 @@ def gemm_epilogue(
         out_dtype=postact_dtype,
         local_reduce_out=local_reduce_out,
         local_reduce_group=local_reduce_group,
+        local_reduce_dim=local_reduce_dim,
         local_reduce_feeds_main=local_reduce_feeds_main,
     )
     return out

@@ -45,19 +45,28 @@ def _empty_k_matmul_into(
         out += bias
 
 
-def _force_local_reduce_config(config: GemmConfig, group: int) -> GemmConfig:
+def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> GemmConfig:
     if group <= 0 or group & (group - 1) != 0:
         raise NotImplementedError(
-            f"local N-group reduce currently requires a positive power-of-two group, got {group}"
+            f"local reduce currently requires a positive power-of-two group, got {group}"
         )
     if config.swap_ab:
-        raise NotImplementedError("local N-group reduce does not support swap_ab")
-    tile_n = max(32, group)
-    if tile_n % group != 0:
-        raise NotImplementedError(
-            f"local N-group reduce requires tile_n divisible by group, got tile_n={tile_n}, group={group}"
-        )
-    return replace(config, tile_n=tile_n, cluster_n=1, swap_ab=False)
+        raise NotImplementedError("local reduce does not support swap_ab")
+    if dim == 1:
+        tile_n = max(32, group)
+        if tile_n % group != 0:
+            raise NotImplementedError(
+                f"local N-group reduce requires tile_n divisible by group, got tile_n={tile_n}, group={group}"
+            )
+        return replace(config, tile_n=tile_n, cluster_n=1, swap_ab=False)
+    if dim == 0:
+        tile_m = 128
+        if tile_m % group != 0:
+            raise NotImplementedError(
+                f"local M-group reduce requires tile_m divisible by group, got tile_m={tile_m}, group={group}"
+            )
+        return replace(config, tile_m=tile_m, cluster_m=2, swap_ab=False)
+    raise NotImplementedError(f"unsupported local_reduce_dim={dim}")
 
 
 def _silu_tanh(x: Tensor) -> Tensor:
@@ -363,13 +372,15 @@ def gemm_act_tuned(
     colvec_bias: Optional[Tensor] = None,
     local_reduce_out: Optional[Tensor] = None,
     local_reduce_group: int | None = None,
+    local_reduce_dim: int | None = None,
     local_reduce_feeds_main: bool = False,
 ) -> None:
     if config is None:
         config = default_config(A.device)
     if local_reduce_out is not None:
         local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
-        config = _force_local_reduce_config(config, local_reduce_group)
+        local_reduce_dim = 1 if local_reduce_dim is None else local_reduce_dim
+        config = _force_local_reduce_config(config, local_reduce_group, local_reduce_dim)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
@@ -436,6 +447,7 @@ def gemm_act_tuned(
         local_reduce_out=local_reduce_out,
         local_reduce_feeds_main=local_reduce_feeds_main,
         local_reduce_group=0 if local_reduce_group is None else local_reduce_group,
+        local_reduce_dim=1 if local_reduce_dim is None else local_reduce_dim,
     )
 
 
@@ -1043,6 +1055,7 @@ def gemm_act(
     colvec_bias: Optional[Tensor] = None,
     local_reduce_out: Optional[Tensor] = None,
     local_reduce_group: int | None = None,
+    local_reduce_dim: int | None = None,
     local_reduce_feeds_main: bool = False,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
@@ -1101,6 +1114,7 @@ def gemm_act(
             colvec_bias=colvec_bias,
             local_reduce_out=local_reduce_out,
             local_reduce_group=local_reduce_group,
+            local_reduce_dim=local_reduce_dim,
             local_reduce_feeds_main=local_reduce_feeds_main,
         )
     elif is_gated:

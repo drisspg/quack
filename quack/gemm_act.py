@@ -23,11 +23,13 @@ from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import (
     ColVecLoad,
     GroupedColVecReduce,
+    GroupedRowVecReduce,
     RowVecLoad,
     Scalar,
     TileStore,
     colvec_reduce_accumulate,
     grouped_colvec_reduce_accumulate,
+    grouped_rowvec_reduce_accumulate,
 )
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
@@ -62,6 +64,7 @@ class GemmActMixin(ComposableEpiMixin):
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
         GroupedColVecReduce("mColVecReduce"),
+        GroupedRowVecReduce("mRowVecReduce"),
         TileStore("mAuxOut"),
     )
     _extra_param_fields = (
@@ -70,6 +73,7 @@ class GemmActMixin(ComposableEpiMixin):
         ("tensor_epilogue_uses_c", cutlass.Constexpr, False),
         ("local_reduce_feeds_main", cutlass.Constexpr, False),
         ("local_reduce_group", cutlass.Constexpr, 0),
+        ("local_reduce_dim", cutlass.Constexpr, 1),
     )
 
     @mlir_namedtuple
@@ -80,11 +84,13 @@ class GemmActMixin(ComposableEpiMixin):
         tensor_epilogue_uses_c: cutlass.Constexpr[bool] = False
         local_reduce_feeds_main: cutlass.Constexpr[bool] = False
         local_reduce_group: cutlass.Constexpr[int] = 0
+        local_reduce_dim: cutlass.Constexpr[int] = 1
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        mRowVecReduce: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
@@ -101,7 +107,9 @@ class GemmActMixin(ComposableEpiMixin):
         d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
         d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
         d["local_reduce_group"] = args.local_reduce_group
+        d["local_reduce_dim"] = args.local_reduce_dim
         self.local_reduce_group = args.local_reduce_group
+        self.local_reduce_dim = args.local_reduce_dim
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d and d[key] is not None:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
@@ -192,6 +200,9 @@ class GemmActMixin(ComposableEpiMixin):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+        tDrRowVecReduce = epi_loop_tensors["mRowVecReduce"]
+        if const_expr(tDrRowVecReduce is not None):
+            grouped_rowvec_reduce_accumulate(self, tDrRowVecReduce, tRS_rD)
         if const_expr(tDrColVecReduce is not None):
             if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
                 grouped_colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)
@@ -417,6 +428,7 @@ def _compile_gemm_act(
     local_reduce_ndim,
     local_reduce_feeds_main,
     local_reduce_group,
+    local_reduce_dim,
     varlen_m,
     varlen_k,
     gather_A,
@@ -471,22 +483,41 @@ def _compile_gemm_act(
         mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4)
     else:
         mColVec = None
-    if local_reduce_ndim == 3:
+    if local_reduce_ndim == 3 and local_reduce_dim == 1:
         mColVecReduce = fake_tensor(
             local_reduce_dtype,
             (l, m, cute.sym_int()),
             leading_dim=2,
             divisibility=1,
         )
-    elif local_reduce_ndim == 2:
+        mRowVecReduce = None
+    elif local_reduce_ndim == 2 and local_reduce_dim == 1:
         mColVecReduce = fake_tensor(
             local_reduce_dtype,
             (m, cute.sym_int()),
             leading_dim=1,
             divisibility=1,
         )
+        mRowVecReduce = None
+    elif local_reduce_ndim == 3 and local_reduce_dim == 0:
+        mColVecReduce = None
+        mRowVecReduce = fake_tensor(
+            local_reduce_dtype,
+            (l, cute.sym_int(), n),
+            leading_dim=2,
+            divisibility=1,
+        )
+    elif local_reduce_ndim == 2 and local_reduce_dim == 0:
+        mColVecReduce = None
+        mRowVecReduce = fake_tensor(
+            local_reduce_dtype,
+            (cute.sym_int(), n),
+            leading_dim=1,
+            divisibility=1,
+        )
     else:
         mColVecReduce = None
+        mRowVecReduce = None
 
     act_fn = None if tensor_epilogue_fn is not None else (
         act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
@@ -507,11 +538,13 @@ def _compile_gemm_act(
         tensor_epilogue_uses_c,
         local_reduce_feeds_main,
         local_reduce_group,
+        local_reduce_dim,
         alpha=fake_scalar(alpha_mode, Float32),
         beta=fake_scalar(beta_mode, Float32),
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
         mColVecReduce=mColVecReduce,
+        mRowVecReduce=mRowVecReduce,
         rounding_mode=rounding_mode,
         sr_seed=fake_scalar(sr_seed_mode),
     )
@@ -577,6 +610,7 @@ def gemm_act(
     local_reduce_out: Optional[Tensor] = None,
     local_reduce_feeds_main: bool = False,
     local_reduce_group: int = 0,
+    local_reduce_dim: int = 1,
 ) -> None:
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
@@ -668,6 +702,7 @@ def gemm_act(
         local_reduce_ndim,
         local_reduce_feeds_main,
         local_reduce_group,
+        local_reduce_dim,
         varlen_m,
         varlen_k,
         gather_A,
@@ -701,11 +736,13 @@ def gemm_act(
         None,
         None,
         None,
+        None,
         alpha=scalar_arg(alpha, alpha_mode, Float32),
         beta=scalar_arg(beta, beta_mode, Float32),
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
-        mColVecReduce=local_reduce_out,
+        mColVecReduce=local_reduce_out if local_reduce_dim == 1 else None,
+        mRowVecReduce=local_reduce_out if local_reduce_dim == 0 else None,
         rounding_mode=None,  # Constexpr, pass None at call time
         sr_seed=scalar_arg(sr_seed, sr_seed_mode),
     )

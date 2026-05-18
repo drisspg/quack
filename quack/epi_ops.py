@@ -577,6 +577,16 @@ def grouped_colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=N
 
 
 @cute.jit
+def grouped_rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None):
+    """Accumulate per-element values for grouped-M reductions."""
+    if const_expr(tDrReduce is not None):
+        if const_expr(transform_fn is None):
+            transform_fn = lambda x: x
+        for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+            tDrReduce[i] += transform_fn(tRS_rInput[i])
+
+
+@cute.jit
 def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
     """Accumulate transform_fn(input) or input * rScale into a RowVecReduce buffer.
 
@@ -801,6 +811,138 @@ class GroupedColVecReduce(VecReduce):
                     group_sum += tDrReduce_flt[i + j]
                 if row_idx < limit_m and group_idx < limit_n_groups:
                     gColVec[row_idx, group_idx] = group_sum
+
+
+class GroupedRowVecReduce(VecReduce):
+    """Row-vector reductions over contiguous M groups inside a CTA tile.
+
+    This first implementation is intentionally narrow: the M group must fit within
+    the M lane group of a single warp. Larger groups that cross warp-M partitions
+    need an additional shared-memory partial reduction and are rejected.
+    """
+
+    dim = 1
+    epi_m_major_preference = 4
+
+    def _smem_warps(self, warp_shape_mnk):
+        return 0
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        result = None
+        if const_expr(param is not None):
+            group_m = const_expr(gemm.local_reduce_group)
+            if const_expr(group_m == 0 or group_m == ctx.tile_M):
+                return RowVecReduce.begin(self, gemm, param, smem_tensor, ctx)
+            assert ctx.tile_M % group_m == 0
+            vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N))
+            tDrReduce_layout = ctx.partition_for_epilogue_fn(
+                cute.make_rmem_tensor(vec_mma_layout, Float32)
+            ).layout
+            tDrReduce = cute.make_rmem_tensor(tDrReduce_layout, Float32)
+            result = (tDrReduce, smem_tensor)
+        return result
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        result = None
+        if const_expr(state is not None):
+            group_m = const_expr(gemm.local_reduce_group)
+            if const_expr(group_m == 0 or group_m == gemm.cta_tile_shape_mnk[0]):
+                return RowVecReduce.begin_loop(self, gemm, state, epi_coord)
+            tDrReduce = state[0]
+            result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            cute.filter_zeros(result).fill(0.0)
+        return result
+
+    @cute.jit
+    def end_loop(
+        self,
+        gemm,
+        param,
+        state,
+        epi_coord,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        if const_expr(param is not None):
+            group_m = const_expr(gemm.local_reduce_group)
+            if const_expr(group_m == 0 or group_m == gemm.cta_tile_shape_mnk[0]):
+                return RowVecReduce.end_loop(
+                    self,
+                    gemm,
+                    param,
+                    state,
+                    epi_coord,
+                    epi_tile,
+                    tiled_copy_t2r,
+                    tiled_copy_r2s,
+                    tile_coord_mnkl,
+                    varlen_manager,
+                    tidx,
+                )
+            tDrReduce = state[0]
+            tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
+
+            lane_layout_MN, _ = _get_lane_warp_layouts(tiled_copy, reference_src)
+            lanes_in_M = cute.size(lane_layout_MN, mode=[0])
+            lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+            assert group_m <= lanes_in_M, (
+                "GroupedRowVecReduce currently requires group_m to fit within one warp M-lane group"
+            )
+            assert lanes_in_M % group_m == 0, (
+                "GroupedRowVecReduce requires lanes_in_M divisible by group_m"
+            )
+            if const_expr(lanes_in_N > 1):
+                assert lane_layout_MN.stride[1] == 1, (
+                    "GroupedRowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
+                )
+
+            partition_for_epilogue_fn = partial(
+                partition_for_epilogue,
+                epi_tile=epi_tile,
+                tiled_copy=tiled_copy,
+                tidx=tidx,
+                reference_src=reference_src,
+            )
+            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            groups_per_cta = const_expr(tile_M // group_m)
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
+            tDrReduce_flt = cute.filter_zeros(tDrReduce_cur)
+            tDcD_flt = cute.filter_zeros(tDcD_cur)
+
+            if const_expr(group_m > 1):
+                for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
+                    reduction_rows = group_m // 2
+                    while reduction_rows > 0:
+                        tDrReduce_flt[i] += cute.arch.shuffle_sync_bfly(
+                            tDrReduce_flt[i],
+                            offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                        )
+                        reduction_rows = reduction_rows // 2
+
+            batch_idx = tile_coord_mnkl[3]
+            limit_n = min(param.shape[2] - tile_coord_mnkl[1] * tile_N, tile_N)
+            limit_m_groups = param.shape[1]
+            mRowVec = param[batch_idx, None, None]
+            gRowVec = cute.local_tile(
+                mRowVec,
+                (groups_per_cta, tile_N),
+                (tile_coord_mnkl[0], tile_coord_mnkl[1]),
+            )
+            for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
+                row_idx = tDcD_flt[i][0]
+                col_idx = tDcD_flt[i][1]
+                group_idx = row_idx // group_m
+                if row_idx % group_m == 0 and group_idx < limit_m_groups and col_idx < limit_n:
+                    gRowVec[group_idx, col_idx] = tDrReduce_flt[i]
 
 
 class ColVecReduce(VecReduce):
