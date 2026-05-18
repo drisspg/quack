@@ -53,7 +53,11 @@ def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> Gemm
     if config.swap_ab:
         raise NotImplementedError("local reduce does not support swap_ab")
     if dim == 1:
-        tile_n = max(32, group)
+        # Keep the selected/default GEMM tile when possible. Forcing tiny
+        # tile_n=max(32, group) preserves correctness but is very slow on
+        # large GEMMs; grouped reductions only require that the tile-N extent
+        # is divisible by the logical group size.
+        tile_n = config.tile_n if config.tile_n % group == 0 else max(32, group)
         if tile_n % group != 0:
             raise NotImplementedError(
                 f"local N-group reduce requires tile_n divisible by group, got tile_n={tile_n}, group={group}"
