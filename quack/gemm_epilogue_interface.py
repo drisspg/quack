@@ -71,6 +71,7 @@ def gemm_epilogue(
     offs: Tensor | None = None,
     epilogue_args: tuple[Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
+    aux_out: Tensor | None = None,
     local_reduce_out: Tensor | None = None,
     local_reduce_group: int | None = None,
     local_reduce_dim: int | None = None,
@@ -80,6 +81,12 @@ def gemm_epilogue(
         local_reduce_group = _validate_local_reduce(
             a, b, local_reduce_out, local_reduce_group, local_reduce_dim
         )
+    if aux_out is not None:
+        if tuple(aux_out.shape) != (*a.shape[:-1], b.shape[-1]):
+            raise RuntimeError(
+                f"aux_out shape must match GEMM output shape {(*a.shape[:-1], b.shape[-1])}, "
+                f"got {tuple(aux_out.shape)}"
+            )
     if offs is not None:
         if local_reduce_out is not None:
             raise NotImplementedError("grouped GEMM epilogue local_reduce_out is not supported yet")
@@ -138,6 +145,10 @@ def gemm_epilogue(
             out_dtype=a.dtype if out_dtype is None else out_dtype,
         )
     epilogue_arg = epilogue_args[0] if epilogue_args else None
+    if aux_out is not None and local_reduce_out is not None:
+        raise NotImplementedError(
+            "QUACK generic aux_out cannot be combined with local_reduce_out"
+        )
     if epilogue_arg is not None:
         inferred_kind = _infer_epilogue_arg_kind(a, b, epilogue_arg)
         if epilogue_arg_kinds and epilogue_arg_kinds != (inferred_kind,):
@@ -150,27 +161,31 @@ def gemm_epilogue(
     row_aux = epilogue_arg.squeeze(0) if epilogue_arg_kind == "row" else None
     col_aux = epilogue_arg.squeeze(-1) if epilogue_arg_kind == "col" else None
     postact_dtype = a.dtype if out_dtype is None else out_dtype
-    _, out = gemm_act(
+    preact_out, out = gemm_act(
         a,
         b,
         C=epilogue_arg if epilogue_arg_kind == "tile" else C,
         bias=row_aux,
         colvec_bias=col_aux,
         activation=None,
-        store_preact=False,
         tuned=False,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
         tensor_epilogue_uses_c=epilogue_arg is not None,
         alpha=alpha,
         beta=beta,
-        out_dtype=postact_dtype,
+        preact_out=None,
+        postact_out=aux_out,
+        out_dtype=out_dtype,
+        postact_dtype=aux_out.dtype if aux_out is not None else postact_dtype,
+        store_preact=aux_out is not None,
+        tensor_epilogue_returns_aux=aux_out is not None,
         local_reduce_out=local_reduce_out,
         local_reduce_group=local_reduce_group,
         local_reduce_dim=local_reduce_dim,
         local_reduce_feeds_main=local_reduce_feeds_main,
     )
-    return out
+    return preact_out if aux_out is not None else out
 
 
 def gemm_relu(a: Tensor, b: Tensor) -> Tensor:

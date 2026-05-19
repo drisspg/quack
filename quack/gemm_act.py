@@ -72,6 +72,7 @@ class GemmActMixin(ComposableEpiMixin):
         ("act_fn", cutlass.Constexpr, None),
         ("tensor_epilogue_fn", cutlass.Constexpr, None),
         ("tensor_epilogue_uses_c", cutlass.Constexpr, False),
+        ("tensor_epilogue_returns_aux", cutlass.Constexpr, False),
         ("local_reduce_feeds_main", cutlass.Constexpr, False),
         ("local_reduce_group", cutlass.Constexpr, 0),
         ("local_reduce_dim", cutlass.Constexpr, 1),
@@ -83,6 +84,7 @@ class GemmActMixin(ComposableEpiMixin):
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
         tensor_epilogue_uses_c: cutlass.Constexpr[bool] = False
+        tensor_epilogue_returns_aux: cutlass.Constexpr[bool] = False
         local_reduce_feeds_main: cutlass.Constexpr[bool] = False
         local_reduce_group: cutlass.Constexpr[int] = 0
         local_reduce_dim: cutlass.Constexpr[int] = 1
@@ -106,6 +108,7 @@ class GemmActMixin(ComposableEpiMixin):
         d["act_fn"] = args.act_fn
         d["tensor_epilogue_fn"] = args.tensor_epilogue_fn
         d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
+        d["tensor_epilogue_returns_aux"] = args.tensor_epilogue_returns_aux
         d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
         d["local_reduce_group"] = args.local_reduce_group
         d["local_reduce_dim"] = args.local_reduce_dim
@@ -238,11 +241,16 @@ class GemmActMixin(ComposableEpiMixin):
                     tRS_rEpilogueAux.store(tDrRowVec.load().to(self.acc_dtype))
                 else:
                     tRS_rEpilogueAux.store(tDrColVec.load().to(self.acc_dtype))
-                tRS_rAuxOut.store(
-                    params.tensor_epilogue_fn(tRS_rEpilogueIn.load(), tRS_rEpilogueAux.load())
+                epilogue_result = params.tensor_epilogue_fn(
+                    tRS_rEpilogueIn.load(), tRS_rEpilogueAux.load()
                 )
             else:
-                tRS_rAuxOut.store(params.tensor_epilogue_fn(tRS_rEpilogueIn.load()))
+                epilogue_result = params.tensor_epilogue_fn(tRS_rEpilogueIn.load())
+            if const_expr(params.tensor_epilogue_returns_aux):
+                tRS_rD.store(epilogue_result[0])
+                tRS_rAuxOut.store(epilogue_result[1])
+            else:
+                tRS_rAuxOut.store(epilogue_result)
         elif const_expr(params.act_fn is not None):
             tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch != 100):
@@ -426,6 +434,7 @@ def _compile_gemm_act(
     tensor_epilogue_fn,
     tensor_epilogue_key,
     tensor_epilogue_uses_c,
+    tensor_epilogue_returns_aux,
     alpha_mode,
     beta_mode,
     rowvec_dtype,
@@ -543,6 +552,7 @@ def _compile_gemm_act(
         act_fn,
         tensor_epilogue_fn,
         tensor_epilogue_uses_c,
+        tensor_epilogue_returns_aux,
         local_reduce_feeds_main,
         local_reduce_group,
         local_reduce_dim,
@@ -612,6 +622,7 @@ def gemm_act(
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
     tensor_epilogue_uses_c: bool = False,
+    tensor_epilogue_returns_aux: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     local_reduce_out: Optional[Tensor] = None,
@@ -700,6 +711,7 @@ def gemm_act(
         tensor_epilogue_fn,
         tensor_epilogue_key if tensor_epilogue_key is not None else repr(tensor_epilogue_fn),
         tensor_epilogue_uses_c,
+        tensor_epilogue_returns_aux,
         alpha_mode,
         beta_mode,
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
@@ -738,6 +750,7 @@ def gemm_act(
 
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
+        None,
         None,
         None,
         None,
