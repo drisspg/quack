@@ -112,8 +112,17 @@ def gemm_epilogue(
                 f"got {tuple(aux_out.shape)}"
             )
     if offs is not None:
-        if local_reduce_out is not None:
-            raise NotImplementedError("grouped GEMM epilogue local_reduce_out is not supported yet")
+        if (
+            epilogue_args
+            or epilogue_arg_kinds
+            or aux_out is not None
+            or local_reduce_out is not None
+            or main_output_transform is not None
+        ):
+            raise NotImplementedError(
+                "grouped GEMM epilogue does not support epilogue args, aux outputs, "
+                "local reductions, or shape-changing main outputs yet"
+            )
         if C is not None or scale_a is not None or scale_b is not None or alpha != 1.0 or beta != 1.0:
             raise NotImplementedError("QUACK grouped GEMM epilogue does not support C/scales/alpha/beta yet")
         if offs.dtype is not torch.int32:
@@ -152,6 +161,10 @@ def gemm_epilogue(
         raise RuntimeError("epilogue_arg_kinds requires an epilogue arg")
     if epilogue_args and C is not None:
         raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
+    if epilogue_args and (alpha != 1.0 or beta != 1.0):
+        raise NotImplementedError(
+            "QUACK epilogue args cannot be combined with non-default alpha/beta yet"
+        )
     if main_output_transform is not None:
         if main_output_transform != "grouped_n_contract" or main_output_transform_group != 2:
             raise NotImplementedError(
@@ -159,6 +172,11 @@ def gemm_epilogue(
                 "grouped_n_contract(group=2), got "
                 f"main_output_transform={main_output_transform!r}, "
                 f"main_output_transform_group={main_output_transform_group!r}"
+            )
+        if b.shape[-1] % main_output_transform_group != 0:
+            raise RuntimeError(
+                "QUACK grouped_n_contract main output requires the GEMM N dimension "
+                f"to be divisible by {main_output_transform_group}, got {b.shape[-1]}"
             )
         if epilogue_args or aux_out is not None or local_reduce_out is not None:
             raise NotImplementedError(

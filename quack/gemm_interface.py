@@ -416,7 +416,7 @@ def gemm_act_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    if colvec_bias is not None and colvec_bias.ndim == 1:
+    if colvec_bias is not None and colvec_bias.ndim == 1 and not varlen_m:
         colvec_bias = colvec_bias.unsqueeze(0)  # (L, M)
     if local_reduce_out is not None or local_reduce_feeds_main:
         if varlen_m:
@@ -1110,6 +1110,11 @@ def gemm_act(
         if main_output_transform_group != 2:
             raise NotImplementedError(
                 "QUACK grouped_n_contract main output currently supports only group=2"
+            )
+        if out_shape[-1] % main_output_transform_group != 0:
+            raise RuntimeError(
+                "QUACK grouped_n_contract main output requires the GEMM N dimension "
+                f"to be divisible by {main_output_transform_group}, got {out_shape[-1]}"
             )
         postact_shape = (*out_shape[:-1], out_shape[-1] // main_output_transform_group)
     else:

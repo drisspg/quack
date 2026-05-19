@@ -372,6 +372,18 @@ class GemmGroupedNContractMixin(GemmActMixin):
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
+    @cute.jit
+    def epi_convert_aux_out(
+        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        tRS_rAuxOut_out = GemmActMixin.epi_convert_aux_out(
+            self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
+        if const_expr(self.arch in (90, 120) and self.aux_out_dtype.width == 16):
+            # Half-N contracted stores use the same b16 register permutation as gated stores.
+            permute_gated_Cregs_b16(tRS_rAuxOut_out)
+        return tRS_rAuxOut_out
+
 
 class GemmGroupedNContractSm80(GemmGroupedNContractMixin, GemmSm80):
     pass
