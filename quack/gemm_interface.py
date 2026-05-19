@@ -386,6 +386,7 @@ def gemm_act_tuned(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    main_output_transform_group: int | None = None,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -468,6 +469,7 @@ def gemm_act_tuned(
         local_reduce_scale=local_reduce_scale,
         local_reduce_max_power=local_reduce_max_power,
         local_reduce_dim=1 if local_reduce_dim is None else local_reduce_dim,
+        main_output_transform_group=main_output_transform_group,
     )
 
 
@@ -1081,6 +1083,8 @@ def gemm_act(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    main_output_transform: str | None = None,
+    main_output_transform_group: int | None = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     if tensor_epilogue_fn is not None:
@@ -1101,7 +1105,15 @@ def gemm_act(
         out_shape = (A.shape[0], B.shape[-1])
     else:
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
-    postact_shape = (*out_shape[:-1], out_shape[-1] // 2) if is_gated else out_shape
+    is_grouped_n_contract = main_output_transform == "grouped_n_contract"
+    if is_grouped_n_contract:
+        if main_output_transform_group != 2:
+            raise NotImplementedError(
+                "QUACK grouped_n_contract main output currently supports only group=2"
+            )
+        postact_shape = (*out_shape[:-1], out_shape[-1] // main_output_transform_group)
+    else:
+        postact_shape = (*out_shape[:-1], out_shape[-1] // 2) if is_gated else out_shape
     if preact_out is None and store_preact:
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
@@ -1144,6 +1156,9 @@ def gemm_act(
             local_reduce_scale=local_reduce_scale,
             local_reduce_max_power=local_reduce_max_power,
             local_reduce_feeds_main=local_reduce_feeds_main,
+            main_output_transform_group=main_output_transform_group
+            if is_grouped_n_contract
+            else None,
         )
     elif is_gated:
         gemm_gated_out(

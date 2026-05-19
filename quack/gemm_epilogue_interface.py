@@ -171,11 +171,15 @@ def gemm_epilogue(
         _, out = gemm_act(
             a,
             b,
-            activation="swiglu",
+            activation=None,
             tuned=False,
-            out_dtype=a.dtype if out_dtype is None else out_dtype,
+            tensor_epilogue_fn=epilogue_fn,
+            tensor_epilogue_key=epilogue_key,
+            out_dtype=out_dtype,
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
             store_preact=False,
+            main_output_transform=main_output_transform,
+            main_output_transform_group=main_output_transform_group,
         )
         return out
     if scale_a is not None or scale_b is not None:

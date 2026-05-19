@@ -286,7 +286,9 @@ class GemmActMixin(ComposableEpiMixin):
                 )
                 tRS_rAuxOut.store(epilogue_result[1])
             else:
-                tRS_rAuxOut = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+                tRS_rAuxOut = cute.make_rmem_tensor(
+                    epilogue_result.shape, self.acc_dtype
+                )
                 tRS_rAuxOut.store(epilogue_result)
         elif const_expr(params.act_fn is not None):
             tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
@@ -324,6 +326,67 @@ def _gated_epi_tile_fn(gemm, epi_tile):
     if isinstance(epi_tile[1], cute.Layout):
         return (epi_tile[0], cute.recast_layout(2, 1, epi_tile[1]))
     return (epi_tile[0], epi_tile[1] // 2)
+
+
+class GemmGroupedNContractMixin(GemmActMixin):
+    _epi_ops = (
+        Scalar("alpha"),
+        Scalar("beta"),
+        Scalar("sr_seed", dtype=Int32),
+        RowVecLoad("mRowVecBroadcast"),
+        ColVecLoad("mColVecBroadcast"),
+        GroupedColVecReduce("mColVecReduce"),
+        GroupedRowVecReduce("mRowVecReduce"),
+        TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
+    )
+
+    def epi_to_underlying_arguments(
+        self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
+    ):
+        self.rounding_mode = args.rounding_mode
+        self.aux_out_dtype = args.mAuxOut.element_type
+        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.cta_tile_shape_aux_out_mn = (
+            self.cta_tile_shape_mnk[0],
+            self.cta_tile_shape_mnk[1] // 2,
+        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        d["tensor_epilogue_fn"] = args.tensor_epilogue_fn
+        d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
+        d["tensor_epilogue_returns_aux"] = args.tensor_epilogue_returns_aux
+        d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
+        d["local_reduce_group"] = args.local_reduce_group
+        d["local_reduce_dim"] = args.local_reduce_dim
+        d["local_reduce_op"] = args.local_reduce_op
+        d["local_reduce_scale"] = args.local_reduce_scale
+        d["local_reduce_max_power"] = args.local_reduce_max_power
+        self.local_reduce_feeds_main = args.local_reduce_feeds_main
+        self.local_reduce_group = args.local_reduce_group
+        self.local_reduce_dim = args.local_reduce_dim
+        self.local_reduce_op = args.local_reduce_op
+        self.local_reduce_scale = args.local_reduce_scale
+        self.local_reduce_max_power = args.local_reduce_max_power
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        return self.EpilogueParams(**d)
+
+
+class GemmGroupedNContractSm80(GemmGroupedNContractMixin, GemmSm80):
+    pass
+
+
+class GemmGroupedNContractSm90(GemmGroupedNContractMixin, GemmSm90):
+    pass
+
+
+class GemmGroupedNContractSm100(GemmGroupedNContractMixin, GemmSm100):
+    pass
+
+
+class GemmGroupedNContractSm120(GemmGroupedNContractMixin, GemmSm120):
+    pass
 
 
 class GemmGatedMixin(GemmActMixin):
@@ -485,6 +548,7 @@ def _compile_gemm_act(
     local_reduce_op,
     local_reduce_scale,
     local_reduce_max_power,
+    main_output_transform_group,
     varlen_m,
     varlen_k,
     gather_A,
@@ -510,6 +574,13 @@ def _compile_gemm_act(
             11: GemmGatedSm100,
             12: GemmGatedSm120,
         },
+        "grouped_n_contract": {
+            8: GemmGroupedNContractSm80,
+            9: GemmGroupedNContractSm90,
+            10: GemmGroupedNContractSm100,
+            11: GemmGroupedNContractSm100,
+            12: GemmGroupedNContractSm120,
+        },
     }
     GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     pa_leading = 1 if postact_major == "n" else 0
@@ -526,9 +597,9 @@ def _compile_gemm_act(
         varlen_k=varlen_k,
         gather_A=gather_A,
     )
-    pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
+    pa_n = cute.sym_int() if gemm_cls_name in ("gated", "grouped_n_contract") else n
     div_pa = div_for_dtype(postact_dtype)
-    pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
+    pa_leading_dim = 1 if gemm_cls_name in ("gated", "grouped_n_contract") else pa_leading
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
     mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
 
@@ -675,10 +746,17 @@ def gemm_act(
     local_reduce_op: str = "sum",
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
+    main_output_transform_group: int | None = None,
 ) -> None:
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
-        gemm_cls_name = "act"
+        if main_output_transform_group is not None:
+            assert main_output_transform_group == 2, (
+                "only grouped_n_contract(group=2) tensor epilogues are supported"
+            )
+            gemm_cls_name = "grouped_n_contract"
+        else:
+            gemm_cls_name = "act"
     elif activation in gate_fn_map:
         gemm_cls_name = "gated"
     else:
@@ -777,6 +855,7 @@ def gemm_act(
         local_reduce_op_code,
         local_reduce_scale,
         local_reduce_max_power,
+        0 if main_output_transform_group is None else main_output_transform_group,
         varlen_m,
         varlen_k,
         gather_A,
