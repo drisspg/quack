@@ -91,7 +91,7 @@ def gemm_epilogue(
             raise NotImplementedError(
                 "QUACK non-sum local_reduce_op currently supports only local N reductions"
             )
-        if local_reduce_op in ("amax_abs", "mx_e8m0_scale") and (
+        if local_reduce_op in ("amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale") and (
             local_reduce_group is None or local_reduce_group >= b.shape[-1]
         ):
             raise NotImplementedError(
@@ -185,6 +185,14 @@ def gemm_epilogue(
         if C is not None or alpha != 1.0 or beta != 1.0:
             raise NotImplementedError(
                 "QUACK shape-changing main epilogues do not support C/alpha/beta yet"
+            )
+        if scale_a is not None or scale_b is not None:
+            raise NotImplementedError(
+                "QUACK shape-changing main epilogues do not support scaled GEMM yet"
+            )
+        if local_reduce_feeds_main:
+            raise NotImplementedError(
+                "QUACK shape-changing main epilogues cannot be combined with local reductions yet"
             )
         _, out = gemm_act(
             a,

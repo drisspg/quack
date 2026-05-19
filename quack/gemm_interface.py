@@ -1089,6 +1089,15 @@ def gemm_act(
     """GEMM with activation (or gated activation) and optional output tensors."""
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
+    if main_output_transform is not None:
+        if main_output_transform != "grouped_n_contract":
+            raise NotImplementedError(
+                f"unsupported main_output_transform={main_output_transform!r}"
+            )
+        if tensor_epilogue_fn is None:
+            raise NotImplementedError(
+                "shape-changing main epilogues require tensor_epilogue_fn"
+            )
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
@@ -1126,7 +1135,18 @@ def gemm_act(
     # Empty-input fast path. For M=0 or N=0 the outputs are empty; for K=0
     # (A@B == 0) the no-bias / no-C surface yields preact=0 and act(0)=0 for
     # every supported activation, so both outputs are zero.
-    if postact_out.numel() == 0 or A.numel() == 0:
+    if postact_out.numel() == 0:
+        if preact_out is not None:
+            _empty_k_matmul_into(preact_out)
+        _empty_k_matmul_into(postact_out)
+        if local_reduce_out is not None:
+            local_reduce_out.zero_()
+        return preact_out, postact_out
+    if A.numel() == 0:
+        if tensor_epilogue_fn is not None:
+            raise NotImplementedError(
+                "K=0 tensor epilogues are not supported by the fast path"
+            )
         if preact_out is not None:
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)

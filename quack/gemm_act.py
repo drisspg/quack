@@ -343,34 +343,12 @@ class GemmGroupedNContractMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ):
-        self.rounding_mode = args.rounding_mode
-        self.aux_out_dtype = args.mAuxOut.element_type
-        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        params = super().epi_to_underlying_arguments(args, loc=loc, ip=ip)
         self.cta_tile_shape_aux_out_mn = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1] // 2,
         )
-        d = self._epi_ops_to_params_dict(args)
-        d["act_fn"] = args.act_fn
-        d["tensor_epilogue_fn"] = args.tensor_epilogue_fn
-        d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
-        d["tensor_epilogue_returns_aux"] = args.tensor_epilogue_returns_aux
-        d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
-        d["local_reduce_group"] = args.local_reduce_group
-        d["local_reduce_dim"] = args.local_reduce_dim
-        d["local_reduce_op"] = args.local_reduce_op
-        d["local_reduce_scale"] = args.local_reduce_scale
-        d["local_reduce_max_power"] = args.local_reduce_max_power
-        self.local_reduce_feeds_main = args.local_reduce_feeds_main
-        self.local_reduce_group = args.local_reduce_group
-        self.local_reduce_dim = args.local_reduce_dim
-        self.local_reduce_op = args.local_reduce_op
-        self.local_reduce_scale = args.local_reduce_scale
-        self.local_reduce_max_power = args.local_reduce_max_power
-        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
-                d[key] = layout_utils.concat_to_interleave(d[key], 1)
-        return self.EpilogueParams(**d)
+        return params
 
     @cute.jit
     def epi_convert_aux_out(
@@ -560,7 +538,6 @@ def _compile_gemm_act(
     local_reduce_op,
     local_reduce_scale,
     local_reduce_max_power,
-    main_output_transform_group,
     varlen_m,
     varlen_k,
     gather_A,
@@ -867,7 +844,6 @@ def gemm_act(
         local_reduce_op_code,
         local_reduce_scale,
         local_reduce_max_power,
-        0 if main_output_transform_group is None else main_output_transform_group,
         varlen_m,
         varlen_k,
         gather_A,
