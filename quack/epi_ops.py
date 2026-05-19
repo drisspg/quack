@@ -859,6 +859,8 @@ class GroupedColVecReduce(VecReduce):
                         group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
                     else:
                         group_value += tDrReduce_flt[i + j]
+                if const_expr(gemm.local_reduce_scale != 1.0):
+                    group_value *= gemm.local_reduce_scale
                 if row_idx < limit_m and group_idx < limit_n_groups:
                     gColVec[row_idx, group_idx] = group_value
 

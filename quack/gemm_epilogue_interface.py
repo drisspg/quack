@@ -76,6 +76,7 @@ def gemm_epilogue(
     local_reduce_group: int | None = None,
     local_reduce_dim: int | None = None,
     local_reduce_op: str = "sum",
+    local_reduce_scale: float = 1.0,
     local_reduce_feeds_main: bool = False,
 ) -> Tensor:
     if local_reduce_out is not None:
@@ -184,6 +185,7 @@ def gemm_epilogue(
         local_reduce_out=local_reduce_out,
         local_reduce_group=local_reduce_group,
         local_reduce_op=local_reduce_op,
+        local_reduce_scale=local_reduce_scale,
         local_reduce_dim=local_reduce_dim,
         local_reduce_feeds_main=local_reduce_feeds_main,
     )

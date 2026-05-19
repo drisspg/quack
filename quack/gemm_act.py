@@ -78,6 +78,7 @@ class GemmActMixin(ComposableEpiMixin):
         ("local_reduce_group", cutlass.Constexpr, 0),
         ("local_reduce_dim", cutlass.Constexpr, 1),
         ("local_reduce_op", cutlass.Constexpr, 0),
+        ("local_reduce_scale", cutlass.Constexpr, 1.0),
     )
 
     @mlir_namedtuple
@@ -91,6 +92,7 @@ class GemmActMixin(ComposableEpiMixin):
         local_reduce_group: cutlass.Constexpr[int] = 0
         local_reduce_dim: cutlass.Constexpr[int] = 1
         local_reduce_op: cutlass.Constexpr[int] = 0
+        local_reduce_scale: cutlass.Constexpr[float] = 1.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -116,10 +118,12 @@ class GemmActMixin(ComposableEpiMixin):
         d["local_reduce_group"] = args.local_reduce_group
         d["local_reduce_dim"] = args.local_reduce_dim
         d["local_reduce_op"] = args.local_reduce_op
+        d["local_reduce_scale"] = args.local_reduce_scale
         self.local_reduce_feeds_main = args.local_reduce_feeds_main
         self.local_reduce_group = args.local_reduce_group
         self.local_reduce_dim = args.local_reduce_dim
         self.local_reduce_op = args.local_reduce_op
+        self.local_reduce_scale = args.local_reduce_scale
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d and d[key] is not None:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
@@ -467,6 +471,7 @@ def _compile_gemm_act(
     local_reduce_group,
     local_reduce_dim,
     local_reduce_op,
+    local_reduce_scale,
     varlen_m,
     varlen_k,
     gather_A,
@@ -579,6 +584,7 @@ def _compile_gemm_act(
         local_reduce_group,
         local_reduce_dim,
         local_reduce_op,
+        local_reduce_scale,
         alpha=fake_scalar(alpha_mode, Float32),
         beta=fake_scalar(beta_mode, Float32),
         mRowVecBroadcast=mRowVec,
@@ -653,6 +659,7 @@ def gemm_act(
     local_reduce_group: int = 0,
     local_reduce_dim: int = 1,
     local_reduce_op: str = "sum",
+    local_reduce_scale: float = 1.0,
 ) -> None:
     if tensor_epilogue_fn is not None:
         assert activation is None, "tensor_epilogue_fn and activation are mutually exclusive"
@@ -748,6 +755,7 @@ def gemm_act(
         local_reduce_group,
         local_reduce_dim,
         local_reduce_op_code,
+        local_reduce_scale,
         varlen_m,
         varlen_k,
         gather_A,
@@ -776,6 +784,7 @@ def gemm_act(
 
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
+        None,
         None,
         None,
         None,
