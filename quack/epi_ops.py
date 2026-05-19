@@ -855,7 +855,11 @@ class GroupedColVecReduce(VecReduce):
                 group_idx = n_idx // group_n
                 group_value = tDrReduce_flt[i]
                 for j in cutlass.range_constexpr(1, group_n):
-                    if const_expr(gemm.local_reduce_op == 1 or gemm.local_reduce_op == 2):
+                    if const_expr(
+                        gemm.local_reduce_op == 1
+                        or gemm.local_reduce_op == 2
+                        or gemm.local_reduce_op == 3
+                    ):
                         group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
                     else:
                         group_value += tDrReduce_flt[i + j]
@@ -866,6 +870,11 @@ class GroupedColVecReduce(VecReduce):
                     scale_unbiased = cutlass.max(cutlass.min(scale_unbiased, 128), -127)
                     group_value = Uint8(scale_unbiased + 127).bitcast(param.element_type)
                 else:
+                    if const_expr(gemm.local_reduce_op == 3):
+                        group_value *= 1.0 / 6.0
+                        group_value = cute.arch.fmin(
+                            cute.arch.fmax(group_value, 0.015625), 448.0
+                        )
                     if const_expr(gemm.local_reduce_scale != 1.0):
                         group_value *= gemm.local_reduce_scale
                     if const_expr(param.element_type != Float32):

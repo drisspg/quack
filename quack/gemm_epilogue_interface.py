@@ -99,6 +99,10 @@ def gemm_epilogue(
             raise NotImplementedError(
                 "QUACK mx_e8m0_scale local_reduce_out must have dtype torch.float8_e8m0fnu"
             )
+        if local_reduce_op == "nvfp4_e4m3_scale" and local_reduce_out.dtype is not torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "QUACK nvfp4_e4m3_scale local_reduce_out must have dtype torch.float8_e4m3fn"
+            )
     if aux_out is not None:
         if tuple(aux_out.shape) != (*a.shape[:-1], b.shape[-1]):
             raise RuntimeError(

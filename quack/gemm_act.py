@@ -228,14 +228,22 @@ class GemmActMixin(ComposableEpiMixin):
                 grouped_rowvec_reduce_accumulate(self, tDrRowVecReduce, tRS_rD)
         if const_expr(tDrColVecReduce is not None):
             if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
-                if const_expr(params.local_reduce_op == 1 or params.local_reduce_op == 2):
+                if const_expr(
+                    params.local_reduce_op == 1
+                    or params.local_reduce_op == 2
+                    or params.local_reduce_op == 3
+                ):
                     grouped_colvec_reduce_accumulate_amax_abs(
                         self, tDrColVecReduce, tRS_rD
                     )
                 else:
                     grouped_colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)
             else:
-                if const_expr(params.local_reduce_op == 1 or params.local_reduce_op == 2):
+                if const_expr(
+                    params.local_reduce_op == 1
+                    or params.local_reduce_op == 2
+                    or params.local_reduce_op == 3
+                ):
                     colvec_reduce_accumulate(
                         self,
                         tDrColVecReduce,
@@ -710,9 +718,12 @@ def gemm_act(
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
     local_reduce_ndim = local_reduce_out.ndim if local_reduce_out is not None else 0
-    local_reduce_op_code = {"sum": 0, "amax_abs": 1, "mx_e8m0_scale": 2}[
-        local_reduce_op
-    ]
+    local_reduce_op_code = {
+        "sum": 0,
+        "amax_abs": 1,
+        "mx_e8m0_scale": 2,
+        "nvfp4_e4m3_scale": 3,
+    }[local_reduce_op]
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
