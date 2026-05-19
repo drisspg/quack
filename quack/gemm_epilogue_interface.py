@@ -79,6 +79,7 @@ def gemm_epilogue(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    main_output_transform: str | None = None,
 ) -> Tensor:
     if local_reduce_out is not None:
         local_reduce_group = _validate_local_reduce(
@@ -150,6 +151,29 @@ def gemm_epilogue(
         raise RuntimeError("epilogue_arg_kinds requires an epilogue arg")
     if epilogue_args and C is not None:
         raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
+    if main_output_transform is not None:
+        if main_output_transform != "swiglu":
+            raise NotImplementedError(
+                f"unsupported QUACK main_output_transform={main_output_transform!r}"
+            )
+        if epilogue_args or aux_out is not None or local_reduce_out is not None:
+            raise NotImplementedError(
+                "QUACK shape-changing main epilogues cannot be combined with aux outputs yet"
+            )
+        if C is not None or alpha != 1.0 or beta != 1.0:
+            raise NotImplementedError(
+                "QUACK shape-changing main epilogues do not support C/alpha/beta yet"
+            )
+        _, out = gemm_act(
+            a,
+            b,
+            activation="swiglu",
+            tuned=False,
+            out_dtype=a.dtype if out_dtype is None else out_dtype,
+            postact_dtype=a.dtype if out_dtype is None else out_dtype,
+            store_preact=False,
+        )
+        return out
     if scale_a is not None or scale_b is not None:
         if local_reduce_out is not None:
             raise NotImplementedError("scaled GEMM epilogue local_reduce_out is not supported yet")
