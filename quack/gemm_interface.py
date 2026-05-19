@@ -1116,9 +1116,9 @@ def gemm_act(
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
     is_grouped_n_contract = main_output_transform == "grouped_n_contract"
     if is_grouped_n_contract:
-        if main_output_transform_group != 2:
+        if main_output_transform_group not in (2, 4):
             raise NotImplementedError(
-                "QUACK grouped_n_contract main output currently supports only group=2"
+                "QUACK grouped_n_contract main output currently supports only groups 2 and 4"
             )
         if out_shape[-1] % main_output_transform_group != 0:
             raise RuntimeError(

@@ -166,10 +166,10 @@ def gemm_epilogue(
             "QUACK epilogue args cannot be combined with non-default alpha/beta yet"
         )
     if main_output_transform is not None:
-        if main_output_transform != "grouped_n_contract" or main_output_transform_group != 2:
+        if main_output_transform != "grouped_n_contract" or main_output_transform_group not in (2, 4):
             raise NotImplementedError(
                 "QUACK shape-changing main epilogues currently support only "
-                "grouped_n_contract(group=2), got "
+                "grouped_n_contract groups 2 and 4, got "
                 f"main_output_transform={main_output_transform!r}, "
                 f"main_output_transform_group={main_output_transform_group!r}"
             )
