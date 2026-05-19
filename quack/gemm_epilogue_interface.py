@@ -84,6 +84,21 @@ def gemm_epilogue(
         local_reduce_group = _validate_local_reduce(
             a, b, local_reduce_out, local_reduce_group, local_reduce_dim
         )
+        local_reduce_dim = 1 if local_reduce_dim is None else local_reduce_dim
+        if local_reduce_op != "sum" and local_reduce_dim != 1:
+            raise NotImplementedError(
+                "QUACK non-sum local_reduce_op currently supports only local N reductions"
+            )
+        if local_reduce_op in ("amax_abs", "mx_e8m0_scale") and (
+            local_reduce_group is None or local_reduce_group >= b.shape[-1]
+        ):
+            raise NotImplementedError(
+                "QUACK non-sum local_reduce_op currently requires grouped local N reductions inside tile_N"
+            )
+        if local_reduce_op == "mx_e8m0_scale" and local_reduce_out.dtype is not torch.float8_e8m0fnu:
+            raise NotImplementedError(
+                "QUACK mx_e8m0_scale local_reduce_out must have dtype torch.float8_e8m0fnu"
+            )
     if aux_out is not None:
         if tuple(aux_out.shape) != (*a.shape[:-1], b.shape[-1]):
             raise RuntimeError(
