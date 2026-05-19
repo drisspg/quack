@@ -568,12 +568,21 @@ def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
 
 @cute.jit
 def grouped_colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None):
-    """Accumulate per-element values for grouped-N reductions."""
+    """Accumulate per-element values for grouped-N sum reductions."""
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
             transform_fn = lambda x: x
         for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
             tDrReduce[i] += transform_fn(tRS_rInput[i])
+
+
+@cute.jit
+def grouped_colvec_reduce_accumulate_amax_abs(gemm, tDrReduce, tRS_rInput):
+    """Accumulate per-element absolute maxima for grouped-N reductions."""
+    if const_expr(tDrReduce is not None):
+        for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+            val = tRS_rInput[i]
+            tDrReduce[i] = cute.arch.fmax(tDrReduce[i], cute.arch.fmax(val, -val))
 
 
 @cute.jit
@@ -844,11 +853,14 @@ class GroupedColVecReduce(VecReduce):
                 row_idx = tDcD_flt[i][0]
                 n_idx = tDcD_flt[i][1]
                 group_idx = n_idx // group_n
-                group_sum = tDrReduce_flt[i]
+                group_value = tDrReduce_flt[i]
                 for j in cutlass.range_constexpr(1, group_n):
-                    group_sum += tDrReduce_flt[i + j]
+                    if const_expr(gemm.local_reduce_op == 1):
+                        group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
+                    else:
+                        group_value += tDrReduce_flt[i + j]
                 if row_idx < limit_m and group_idx < limit_n_groups:
-                    gColVec[row_idx, group_idx] = group_sum
+                    gColVec[row_idx, group_idx] = group_value
 
 
 class GroupedRowVecReduce(VecReduce):
