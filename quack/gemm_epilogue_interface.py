@@ -81,7 +81,6 @@ def gemm_epilogue(
     local_reduce_feeds_main: bool = False,
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
-    main_output_expression: str | None = None,
 ) -> Tensor:
     if local_reduce_out is not None:
         local_reduce_group = _validate_local_reduce(
@@ -154,17 +153,12 @@ def gemm_epilogue(
     if epilogue_args and C is not None:
         raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
     if main_output_transform is not None:
-        if (
-            main_output_transform != "grouped_n_contract"
-            or main_output_transform_group != 2
-            or main_output_expression != "swiglu"
-        ):
+        if main_output_transform != "grouped_n_contract" or main_output_transform_group != 2:
             raise NotImplementedError(
                 "QUACK shape-changing main epilogues currently support only "
-                "grouped_n_contract(group=2, expression='swiglu'), got "
+                "grouped_n_contract(group=2), got "
                 f"main_output_transform={main_output_transform!r}, "
-                f"main_output_transform_group={main_output_transform_group!r}, "
-                f"main_output_expression={main_output_expression!r}"
+                f"main_output_transform_group={main_output_transform_group!r}"
             )
         if epilogue_args or aux_out is not None or local_reduce_out is not None:
             raise NotImplementedError(
