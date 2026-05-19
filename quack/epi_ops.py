@@ -16,7 +16,7 @@ from functools import partial
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Float32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint8, const_expr
 
 from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
 from quack.sm90_utils import partition_for_epilogue
@@ -855,14 +855,21 @@ class GroupedColVecReduce(VecReduce):
                 group_idx = n_idx // group_n
                 group_value = tDrReduce_flt[i]
                 for j in cutlass.range_constexpr(1, group_n):
-                    if const_expr(gemm.local_reduce_op == 1):
+                    if const_expr(gemm.local_reduce_op == 1 or gemm.local_reduce_op == 2):
                         group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
                     else:
                         group_value += tDrReduce_flt[i + j]
-                if const_expr(gemm.local_reduce_scale != 1.0):
-                    group_value *= gemm.local_reduce_scale
-                if const_expr(param.element_type != Float32):
-                    group_value = group_value.to(param.element_type)
+                if const_expr(gemm.local_reduce_op == 2):
+                    bits = Float32(group_value).bitcast(Int32)
+                    exp_unbiased = ((bits >> 23) & 0xFF) - 127
+                    scale_unbiased = exp_unbiased - gemm.local_reduce_max_power
+                    scale_unbiased = cutlass.max(cutlass.min(scale_unbiased, 128), -127)
+                    group_value = Uint8(scale_unbiased + 127).bitcast(param.element_type)
+                else:
+                    if const_expr(gemm.local_reduce_scale != 1.0):
+                        group_value *= gemm.local_reduce_scale
+                    if const_expr(param.element_type != Float32):
+                        group_value = group_value.to(param.element_type)
                 if row_idx < limit_m and group_idx < limit_n_groups:
                     gColVec[row_idx, group_idx] = group_value
 

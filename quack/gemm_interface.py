@@ -384,6 +384,7 @@ def gemm_act_tuned(
     local_reduce_dim: int | None = None,
     local_reduce_op: str = "sum",
     local_reduce_scale: float = 1.0,
+    local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
 ) -> None:
     if config is None:
@@ -465,6 +466,7 @@ def gemm_act_tuned(
         local_reduce_group=0 if local_reduce_group is None else local_reduce_group,
         local_reduce_op=local_reduce_op,
         local_reduce_scale=local_reduce_scale,
+        local_reduce_max_power=local_reduce_max_power,
         local_reduce_dim=1 if local_reduce_dim is None else local_reduce_dim,
     )
 
@@ -1077,6 +1079,7 @@ def gemm_act(
     local_reduce_dim: int | None = None,
     local_reduce_op: str = "sum",
     local_reduce_scale: float = 1.0,
+    local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
@@ -1139,6 +1142,7 @@ def gemm_act(
             local_reduce_dim=local_reduce_dim,
             local_reduce_op=local_reduce_op,
             local_reduce_scale=local_reduce_scale,
+            local_reduce_max_power=local_reduce_max_power,
             local_reduce_feeds_main=local_reduce_feeds_main,
         )
     elif is_gated:
