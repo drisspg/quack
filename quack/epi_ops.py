@@ -587,6 +587,44 @@ def grouped_rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=N
 
 
 @cute.jit
+def grouped_rowvec_reduce_value(gemm, tRS_rInput, row_state):
+    """Return per-element grouped-M sums for value-producing row reductions.
+
+    This mirrors GroupedRowVecReduce's same-warp M-lane shuffle, but produces a
+    register value immediately so it can feed the main output before stores.
+    """
+    result = None
+    if const_expr(row_state is not None):
+        group_m = const_expr(gemm.local_reduce_group)
+        lane_layout_MN = row_state[0]
+        lanes_in_M = cute.size(lane_layout_MN, mode=[0])
+        lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+        assert group_m <= lanes_in_M, (
+            "grouped_rowvec_reduce_value requires group_m to fit within one warp M-lane group"
+        )
+        assert lanes_in_M % group_m == 0, (
+            "grouped_rowvec_reduce_value requires lanes_in_M divisible by group_m"
+        )
+        if const_expr(lanes_in_N > 1):
+            assert lane_layout_MN.stride[1] == 1, (
+                "grouped_rowvec_reduce_value assumes contiguous N lanes when lanes_in_N > 1"
+            )
+        result = cute.make_rmem_tensor_like(tRS_rInput, tRS_rInput.element_type)
+        cute.autovec_copy(tRS_rInput, result)
+        result_flt = cute.filter_zeros(result)
+        if const_expr(group_m > 1):
+            for i in cutlass.range(cute.size(result_flt), unroll_full=True):
+                reduction_rows = group_m // 2
+                while reduction_rows > 0:
+                    result_flt[i] += cute.arch.shuffle_sync_bfly(
+                        result_flt[i],
+                        offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                    )
+                    reduction_rows = reduction_rows // 2
+    return result
+
+
+@cute.jit
 def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
     """Accumulate transform_fn(input) or input * rScale into a RowVecReduce buffer.
 
@@ -830,8 +868,18 @@ class GroupedRowVecReduce(VecReduce):
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
         result = None
-        if const_expr(param is not None):
-            group_m = const_expr(gemm.local_reduce_group)
+        group_m = const_expr(gemm.local_reduce_group)
+        if const_expr(
+            param is None
+            and gemm.local_reduce_feeds_main
+            and gemm.local_reduce_dim == 0
+            and group_m != 0
+        ):
+            tiled_copy = ctx.tiled_copy_t2r if ctx.tiled_copy_t2r is not None else ctx.tiled_copy_r2s
+            reference_src = ctx.tiled_copy_t2r is None
+            lane_layout_MN, _ = _get_lane_warp_layouts(tiled_copy, reference_src)
+            result = (lane_layout_MN,)
+        elif const_expr(param is not None):
             if const_expr(group_m == 0 or group_m == ctx.tile_M):
                 return RowVecReduce.begin(self, gemm, param, smem_tensor, ctx)
             assert ctx.tile_M % group_m == 0
@@ -848,6 +896,10 @@ class GroupedRowVecReduce(VecReduce):
         result = None
         if const_expr(state is not None):
             group_m = const_expr(gemm.local_reduce_group)
+            if const_expr(
+                gemm.local_reduce_feeds_main and gemm.local_reduce_dim == 0
+            ):
+                return state
             if const_expr(group_m == 0 or group_m == gemm.cta_tile_shape_mnk[0]):
                 return RowVecReduce.begin_loop(self, gemm, state, epi_coord)
             tDrReduce = state[0]

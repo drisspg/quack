@@ -76,12 +76,9 @@ def gemm_epilogue(
     local_reduce_dim: int | None = None,
     local_reduce_feeds_main: bool = False,
 ) -> Tensor:
-    local_reduce_group = _validate_local_reduce(
-        a, b, local_reduce_out, local_reduce_group, local_reduce_dim
-    )
-    if local_reduce_out is not None and local_reduce_feeds_main and local_reduce_dim == 0:
-        raise NotImplementedError(
-            "local M-group reductions feeding the main output are not supported yet"
+    if local_reduce_out is not None:
+        local_reduce_group = _validate_local_reduce(
+            a, b, local_reduce_out, local_reduce_group, local_reduce_dim
         )
     if offs is not None:
         if local_reduce_out is not None:

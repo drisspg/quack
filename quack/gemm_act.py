@@ -30,6 +30,7 @@ from quack.epi_ops import (
     colvec_reduce_accumulate,
     grouped_colvec_reduce_accumulate,
     grouped_rowvec_reduce_accumulate,
+    grouped_rowvec_reduce_value,
 )
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
@@ -108,6 +109,7 @@ class GemmActMixin(ComposableEpiMixin):
         d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
         d["local_reduce_group"] = args.local_reduce_group
         d["local_reduce_dim"] = args.local_reduce_dim
+        self.local_reduce_feeds_main = args.local_reduce_feeds_main
         self.local_reduce_group = args.local_reduce_group
         self.local_reduce_dim = args.local_reduce_dim
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
@@ -202,7 +204,12 @@ class GemmActMixin(ComposableEpiMixin):
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
         tDrRowVecReduce = epi_loop_tensors["mRowVecReduce"]
         if const_expr(tDrRowVecReduce is not None):
-            grouped_rowvec_reduce_accumulate(self, tDrRowVecReduce, tRS_rD)
+            if const_expr(params.local_reduce_feeds_main and params.local_reduce_dim == 0):
+                tDrRowVecReduceVal = grouped_rowvec_reduce_value(self, tRS_rD, tDrRowVecReduce)
+                for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                    tRS_rD[i] /= tDrRowVecReduceVal[i]
+            else:
+                grouped_rowvec_reduce_accumulate(self, tDrRowVecReduce, tRS_rD)
         if const_expr(tDrColVecReduce is not None):
             if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
                 grouped_colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD)

@@ -385,7 +385,7 @@ def gemm_act_tuned(
 ) -> None:
     if config is None:
         config = default_config(A.device)
-    if local_reduce_out is not None:
+    if local_reduce_out is not None or local_reduce_feeds_main:
         local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
         local_reduce_dim = 1 if local_reduce_dim is None else local_reduce_dim
         config = _force_local_reduce_config(config, local_reduce_group, local_reduce_dim)
@@ -413,19 +413,14 @@ def gemm_act_tuned(
         bias = bias.unsqueeze(0)  # (L, N)
     if colvec_bias is not None and colvec_bias.ndim == 1:
         colvec_bias = colvec_bias.unsqueeze(0)  # (L, M)
-    if local_reduce_out is not None:
+    if local_reduce_out is not None or local_reduce_feeds_main:
         if varlen_m:
-            raise NotImplementedError("local_reduce_out with varlen_m is not supported yet")
-        if local_reduce_dim == 0:
-            if local_reduce_feeds_main:
-                raise NotImplementedError(
-                    "local M-group reductions feeding the main output are not supported yet"
-                )
-            if A.shape[-2] % 128 != 0:
-                raise NotImplementedError(
-                    "local M-group reductions currently require M to be a multiple of tile_m=128"
-                )
-        if local_reduce_out.ndim == 2:
+            raise NotImplementedError("local reduce with varlen_m is not supported yet")
+        if local_reduce_dim == 0 and A.shape[-2] % 128 != 0:
+            raise NotImplementedError(
+                "local M-group reductions currently require M to be a multiple of tile_m=128"
+            )
+        if local_reduce_out is not None and local_reduce_out.ndim == 2:
             local_reduce_out = local_reduce_out.unsqueeze(0)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
