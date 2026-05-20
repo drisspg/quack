@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
-from quack.gemm_interface import gemm_act
+from quack.gemm_interface import _validate_local_reduce_op_and_dtype, gemm_act
 
 
 def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
@@ -83,6 +83,7 @@ def gemm_epilogue(
     main_output_transform_group: int | None = None,
 ) -> Tensor:
     if local_reduce_out is not None:
+        _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = _validate_local_reduce(
             a, b, local_reduce_out, local_reduce_group, local_reduce_dim
         )

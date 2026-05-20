@@ -46,6 +46,28 @@ def _empty_k_matmul_into(
         out += bias
 
 
+_LOCAL_REDUCE_OPS = {"sum", "amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale"}
+_SCALE_LOCAL_REDUCE_OPS = {"mx_e8m0_scale", "nvfp4_e4m3_scale"}
+
+
+def _validate_local_reduce_op_and_dtype(
+    local_reduce_op: str,
+    local_reduce_out: Tensor | None,
+) -> None:
+    if local_reduce_op not in _LOCAL_REDUCE_OPS:
+        raise NotImplementedError(f"unsupported local_reduce_op={local_reduce_op!r}")
+    if local_reduce_out is None:
+        return
+    if local_reduce_op == "mx_e8m0_scale" and local_reduce_out.dtype is not torch.float8_e8m0fnu:
+        raise NotImplementedError(
+            "QUACK mx_e8m0_scale local_reduce_out must have dtype torch.float8_e8m0fnu"
+        )
+    if local_reduce_op == "nvfp4_e4m3_scale" and local_reduce_out.dtype is not torch.float8_e4m3fn:
+        raise NotImplementedError(
+            "QUACK nvfp4_e4m3_scale local_reduce_out must have dtype torch.float8_e4m3fn"
+        )
+
+
 def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> GemmConfig:
     if group <= 0 or group & (group - 1) != 0:
         raise NotImplementedError(
@@ -392,9 +414,18 @@ def gemm_act_tuned(
     if config is None:
         config = default_config(A.device)
     if local_reduce_out is not None or local_reduce_feeds_main:
+        _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
         local_reduce_dim = 1 if local_reduce_dim is None else local_reduce_dim
         config = _force_local_reduce_config(config, local_reduce_group, local_reduce_dim)
+        if (
+            local_reduce_op in _SCALE_LOCAL_REDUCE_OPS
+            and local_reduce_dim == 1
+            and local_reduce_group >= config.tile_n
+        ):
+            raise NotImplementedError(
+                "QUACK scale local_reduce_op requires group smaller than the selected tile_n"
+            )
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
