@@ -117,11 +117,10 @@ def gemm_epilogue(
             or epilogue_arg_kinds
             or aux_out is not None
             or local_reduce_out is not None
-            or main_output_transform is not None
         ):
             raise NotImplementedError(
                 "grouped GEMM epilogue does not support epilogue args, aux outputs, "
-                "local reductions, or shape-changing main outputs yet"
+                "or local reductions yet"
             )
         if C is not None or scale_a is not None or scale_b is not None or alpha != 1.0 or beta != 1.0:
             raise NotImplementedError("QUACK grouped GEMM epilogue does not support C/scales/alpha/beta yet")
@@ -148,7 +147,10 @@ def gemm_epilogue(
             tensor_epilogue_key=epilogue_key,
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
-            out_dtype=a.dtype if out_dtype is None else out_dtype,
+            out_dtype=out_dtype,
+            postact_dtype=a.dtype if out_dtype is None else out_dtype,
+            main_output_transform=main_output_transform,
+            main_output_transform_group=main_output_transform_group,
         )
         return out
     if epilogue_args and len(epilogue_args) != 1:
