@@ -33,10 +33,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.rounding import RoundingMode
-import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
+from quack import layout_utils
 
 
 class GemmDActMixin(GemmActMixin):
@@ -139,8 +139,8 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
-        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
         implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
@@ -481,9 +481,9 @@ def gemm_dact(
         use_tma_gather=use_tma_gather,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

@@ -50,7 +50,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 import quack.layout_utils as layout_utils
 import quack.copy_utils as copy_utils
 from quack.layout_utils import permute_gated_Cregs_b16
@@ -129,11 +129,11 @@ class GemmActMixin(ComposableEpiMixin):
         self.local_reduce_scale = args.local_reduce_scale
         self.local_reduce_max_power = args.local_reduce_max_power
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
-    # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
+    # epi_get_tma_atoms, epi_smem_bytes, epi_get_smem_struct,
     # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
     def epi_make_aux_out_copy_atom_r2s(self, params, tiled_copy_t2r):
@@ -217,8 +217,8 @@ class GemmActMixin(ComposableEpiMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
-        tDrRowVecReduce = epi_loop_tensors["mRowVecReduce"]
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
+        tDrRowVecReduce = epi_loop_tensors.get("mRowVecReduce")
         if const_expr(tDrRowVecReduce is not None):
             if const_expr(params.local_reduce_feeds_main and params.local_reduce_dim == 0):
                 tDrRowVecReduceVal = grouped_rowvec_reduce_value(self, tRS_rD, tDrRowVecReduce)
@@ -265,8 +265,8 @@ class GemmActMixin(ComposableEpiMixin):
             tRS_rEpilogueIn = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
             tRS_rEpilogueIn.store(tRS_rD.load())
             if const_expr(params.tensor_epilogue_uses_c):
-                tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-                tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+                tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+                tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
                 tRS_rEpilogueAux = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
                 if const_expr(tRS_rC is not None):
                     tRS_rEpilogueAux.store(tRS_rC.load().to(self.acc_dtype))
@@ -448,7 +448,7 @@ class GemmGatedMixin(GemmActMixin):
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
@@ -905,9 +905,9 @@ def gemm_act(
         use_tma_gather=use_tma_gather,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

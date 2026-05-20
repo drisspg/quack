@@ -31,7 +31,7 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.rounding import RoundingMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.gemm_tvm_ffi_utils import (
     div_for_dtype,
     get_major,
@@ -91,8 +91,8 @@ class GemmSqReduceMixin(GemmActMixin):
 
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
-        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
         # Load accumulator, apply alpha/beta/C (skip rowvec/colvec — we handle rowvec below)
         rD = tRS_rD.load()
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -298,9 +298,9 @@ def gemm_sq_reduce(
         device_capacity,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
