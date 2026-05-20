@@ -9,7 +9,7 @@ from quack.gemm_interface import gemm_act
 
 def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
     m, n = a.shape[-2], b.shape[-1]
-    if arg.shape == (m, n):
+    if tuple(arg.shape) == (*a.shape[:-1], n):
         return "tile"
     if arg.shape == (1, n):
         return "row"
