@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import os
 
 import torch
 from torch import Tensor
@@ -79,9 +80,13 @@ def gemm_epilogue(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    local_reduce_source_from_epilogue: bool = False,
+    tuned: bool | None = None,
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
 ) -> Tensor:
+    if tuned is None:
+        tuned = os.getenv("QUACK_GEMM_EPILOGUE_TUNED", "0") == "1"
     if local_reduce_out is not None:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = _validate_local_reduce(
@@ -143,7 +148,7 @@ def gemm_epilogue(
             b,
             activation=None,
             store_preact=False,
-            tuned=False,
+            tuned=tuned,
             tensor_epilogue_fn=epilogue_fn,
             tensor_epilogue_key=epilogue_key,
             cu_seqlens_m=cu_seqlens_m,
@@ -201,7 +206,7 @@ def gemm_epilogue(
             a,
             b,
             activation=None,
-            tuned=False,
+            tuned=tuned,
             tensor_epilogue_fn=epilogue_fn,
             tensor_epilogue_key=epilogue_key,
             out_dtype=out_dtype,
@@ -251,7 +256,7 @@ def gemm_epilogue(
         bias=row_aux,
         colvec_bias=col_aux,
         activation=None,
-        tuned=False,
+        tuned=tuned,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
         tensor_epilogue_uses_c=epilogue_arg is not None,
@@ -270,6 +275,7 @@ def gemm_epilogue(
         local_reduce_max_power=local_reduce_max_power,
         local_reduce_dim=local_reduce_dim,
         local_reduce_feeds_main=local_reduce_feeds_main,
+        local_reduce_source_from_epilogue=local_reduce_source_from_epilogue,
     )
     return preact_out if aux_out is not None else out
 

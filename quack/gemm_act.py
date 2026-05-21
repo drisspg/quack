@@ -75,6 +75,7 @@ class GemmActMixin(ComposableEpiMixin):
         ("tensor_epilogue_uses_c", cutlass.Constexpr, False),
         ("tensor_epilogue_returns_aux", cutlass.Constexpr, False),
         ("local_reduce_feeds_main", cutlass.Constexpr, False),
+        ("local_reduce_source_from_epilogue", cutlass.Constexpr, False),
         ("local_reduce_group", cutlass.Constexpr, 0),
         ("local_reduce_dim", cutlass.Constexpr, 1),
         ("local_reduce_op", cutlass.Constexpr, 0),
@@ -90,6 +91,7 @@ class GemmActMixin(ComposableEpiMixin):
         tensor_epilogue_uses_c: cutlass.Constexpr[bool] = False
         tensor_epilogue_returns_aux: cutlass.Constexpr[bool] = False
         local_reduce_feeds_main: cutlass.Constexpr[bool] = False
+        local_reduce_source_from_epilogue: cutlass.Constexpr[bool] = False
         local_reduce_group: cutlass.Constexpr[int] = 0
         local_reduce_dim: cutlass.Constexpr[int] = 1
         local_reduce_op: cutlass.Constexpr[int] = 0
@@ -117,12 +119,14 @@ class GemmActMixin(ComposableEpiMixin):
         d["tensor_epilogue_uses_c"] = args.tensor_epilogue_uses_c
         d["tensor_epilogue_returns_aux"] = args.tensor_epilogue_returns_aux
         d["local_reduce_feeds_main"] = args.local_reduce_feeds_main
+        d["local_reduce_source_from_epilogue"] = args.local_reduce_source_from_epilogue
         d["local_reduce_group"] = args.local_reduce_group
         d["local_reduce_dim"] = args.local_reduce_dim
         d["local_reduce_op"] = args.local_reduce_op
         d["local_reduce_scale"] = args.local_reduce_scale
         d["local_reduce_max_power"] = args.local_reduce_max_power
         self.local_reduce_feeds_main = args.local_reduce_feeds_main
+        self.local_reduce_source_from_epilogue = args.local_reduce_source_from_epilogue
         self.local_reduce_group = args.local_reduce_group
         self.local_reduce_dim = args.local_reduce_dim
         self.local_reduce_op = args.local_reduce_op
@@ -219,14 +223,14 @@ class GemmActMixin(ComposableEpiMixin):
     ) -> Optional[cute.Tensor]:
         tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         tDrRowVecReduce = epi_loop_tensors.get("mRowVecReduce")
-        if const_expr(tDrRowVecReduce is not None):
+        if const_expr(tDrRowVecReduce is not None and not params.local_reduce_source_from_epilogue):
             if const_expr(params.local_reduce_feeds_main and params.local_reduce_dim == 0):
                 tDrRowVecReduceVal = grouped_rowvec_reduce_value(self, tRS_rD, tDrRowVecReduce)
                 for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
                     tRS_rD[i] /= tDrRowVecReduceVal[i]
             else:
                 grouped_rowvec_reduce_accumulate(self, tDrRowVecReduce, tRS_rD)
-        if const_expr(tDrColVecReduce is not None):
+        if const_expr(tDrColVecReduce is not None and not params.local_reduce_source_from_epilogue):
             if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
                 if const_expr(
                     params.local_reduce_op == 1
@@ -279,7 +283,47 @@ class GemmActMixin(ComposableEpiMixin):
                 )
             else:
                 epilogue_result = params.tensor_epilogue_fn(tRS_rEpilogueIn.load())
-            if const_expr(params.tensor_epilogue_returns_aux):
+            if const_expr(params.local_reduce_source_from_epilogue):
+                tRS_rD.store(epilogue_result[0])
+                tRS_rLocalReduceSource = cute.make_rmem_tensor(
+                    epilogue_result[1].shape, self.acc_dtype
+                )
+                tRS_rLocalReduceSource.store(epilogue_result[1])
+                if const_expr(tDrColVecReduce is not None):
+                    if const_expr(params.local_reduce_group != 0 and params.local_reduce_group < self.cta_tile_shape_mnk[1]):
+                        if const_expr(
+                            params.local_reduce_op == 1
+                            or params.local_reduce_op == 2
+                            or params.local_reduce_op == 3
+                        ):
+                            grouped_colvec_reduce_accumulate_amax_abs(
+                                self, tDrColVecReduce, tRS_rLocalReduceSource
+                            )
+                        else:
+                            grouped_colvec_reduce_accumulate(
+                                self, tDrColVecReduce, tRS_rLocalReduceSource
+                            )
+                    else:
+                        if const_expr(
+                            params.local_reduce_op == 1
+                            or params.local_reduce_op == 2
+                            or params.local_reduce_op == 3
+                        ):
+                            colvec_reduce_accumulate(
+                                self,
+                                tDrColVecReduce,
+                                tRS_rLocalReduceSource,
+                                transform_fn=lambda x: cute.arch.fmax(x, -x),
+                            )
+                        else:
+                            colvec_reduce_accumulate(
+                                self, tDrColVecReduce, tRS_rLocalReduceSource
+                            )
+                tRS_rAuxOut = cute.make_rmem_tensor(
+                    epilogue_result[0].shape, self.acc_dtype
+                )
+                tRS_rAuxOut.store(epilogue_result[0])
+            elif const_expr(params.tensor_epilogue_returns_aux):
                 tRS_rD.store(epilogue_result[0])
                 tRS_rAuxOut = cute.make_rmem_tensor(
                     epilogue_result[1].shape, self.acc_dtype
@@ -570,6 +614,7 @@ def _compile_gemm_act(
     local_reduce_dtype,
     local_reduce_ndim,
     local_reduce_feeds_main,
+    local_reduce_source_from_epilogue,
     local_reduce_group,
     local_reduce_dim,
     local_reduce_op,
@@ -702,6 +747,7 @@ def _compile_gemm_act(
         tensor_epilogue_uses_c,
         tensor_epilogue_returns_aux,
         local_reduce_feeds_main,
+        local_reduce_source_from_epilogue,
         local_reduce_group,
         local_reduce_dim,
         local_reduce_op,
@@ -778,6 +824,7 @@ def gemm_act(
     beta: float | Tensor = 1.0,
     local_reduce_out: Optional[Tensor] = None,
     local_reduce_feeds_main: bool = False,
+    local_reduce_source_from_epilogue: bool = False,
     local_reduce_group: int = 0,
     local_reduce_dim: int = 1,
     local_reduce_op: str = "sum",
@@ -839,6 +886,7 @@ def gemm_act(
         "amax_abs": 1,
         "mx_e8m0_scale": 2,
         "nvfp4_e4m3_scale": 3,
+        "copy": 4,
     }[local_reduce_op]
 
     device_capacity = get_device_capacity(A.device)
@@ -888,6 +936,7 @@ def gemm_act(
         torch2cute_dtype_map[local_reduce_out.dtype] if local_reduce_out is not None else None,
         local_reduce_ndim,
         local_reduce_feeds_main,
+        local_reduce_source_from_epilogue,
         local_reduce_group,
         local_reduce_dim,
         local_reduce_op_code,
@@ -922,6 +971,7 @@ def gemm_act(
 
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
+        None,
         None,
         None,
         None,

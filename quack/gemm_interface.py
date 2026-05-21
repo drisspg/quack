@@ -46,7 +46,7 @@ def _empty_k_matmul_into(
         out += bias
 
 
-_LOCAL_REDUCE_OPS = {"sum", "amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale"}
+_LOCAL_REDUCE_OPS = {"sum", "amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale", "copy"}
 _SCALE_LOCAL_REDUCE_OPS = {"mx_e8m0_scale", "nvfp4_e4m3_scale"}
 
 
@@ -409,6 +409,7 @@ def gemm_act_tuned(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    local_reduce_source_from_epilogue: bool = False,
     main_output_transform_group: int | None = None,
 ) -> None:
     if config is None:
@@ -496,6 +497,7 @@ def gemm_act_tuned(
         beta=beta,
         local_reduce_out=local_reduce_out,
         local_reduce_feeds_main=local_reduce_feeds_main,
+        local_reduce_source_from_epilogue=local_reduce_source_from_epilogue,
         local_reduce_group=0 if local_reduce_group is None else local_reduce_group,
         local_reduce_op=local_reduce_op,
         local_reduce_scale=local_reduce_scale,
@@ -1117,6 +1119,7 @@ def gemm_act(
     local_reduce_scale: float = 1.0,
     local_reduce_max_power: int = 8,
     local_reduce_feeds_main: bool = False,
+    local_reduce_source_from_epilogue: bool = False,
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
@@ -1189,7 +1192,8 @@ def gemm_act(
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
     if tensor_epilogue_fn is not None:
-        partial(gemm_act_tuned.fn, config=None)(
+        fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
+        fn(
             A,
             B,
             preact_out,
@@ -1215,6 +1219,7 @@ def gemm_act(
             local_reduce_scale=local_reduce_scale,
             local_reduce_max_power=local_reduce_max_power,
             local_reduce_feeds_main=local_reduce_feeds_main,
+            local_reduce_source_from_epilogue=local_reduce_source_from_epilogue,
             main_output_transform_group=main_output_transform_group
             if is_grouped_n_contract
             else None,

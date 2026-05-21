@@ -1042,15 +1042,16 @@ class GroupedColVecReduce(VecReduce):
                 n_idx = tDcD_flt[i][1]
                 group_idx = n_idx // group_n
                 group_value = tDrReduce_flt[i]
-                for j in cutlass.range_constexpr(1, group_n):
-                    if const_expr(
-                        gemm.local_reduce_op == 1
-                        or gemm.local_reduce_op == 2
-                        or gemm.local_reduce_op == 3
-                    ):
-                        group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
-                    else:
-                        group_value += tDrReduce_flt[i + j]
+                if const_expr(gemm.local_reduce_op != 4):
+                    for j in cutlass.range_constexpr(1, group_n):
+                        if const_expr(
+                            gemm.local_reduce_op == 1
+                            or gemm.local_reduce_op == 2
+                            or gemm.local_reduce_op == 3
+                        ):
+                            group_value = cute.arch.fmax(group_value, tDrReduce_flt[i + j])
+                        else:
+                            group_value += tDrReduce_flt[i + j]
                 if const_expr(gemm.local_reduce_op == 2):
                     bits = Float32(group_value).bitcast(Int32)
                     exp_unbiased = ((bits >> 23) & 0xFF) - 127
