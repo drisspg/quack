@@ -82,11 +82,14 @@ def gemm_epilogue(
     local_reduce_feeds_main: bool = False,
     local_reduce_source_from_epilogue: bool = False,
     tuned: bool | None = None,
+    epilogue_source: str | None = None,
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
 ) -> Tensor:
     if tuned is None:
         tuned = os.getenv("QUACK_GEMM_EPILOGUE_TUNED", "0") == "1"
+    if epilogue_source is not None:
+        setattr(epilogue_fn, "__quack_cache_key__", f"epilogue:{epilogue_key}")
     if local_reduce_out is not None:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = _validate_local_reduce(
@@ -151,6 +154,7 @@ def gemm_epilogue(
             tuned=tuned,
             tensor_epilogue_fn=epilogue_fn,
             tensor_epilogue_key=epilogue_key,
+            tensor_epilogue_source=epilogue_source,
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
             out_dtype=out_dtype,
@@ -209,6 +213,7 @@ def gemm_epilogue(
             tuned=tuned,
             tensor_epilogue_fn=epilogue_fn,
             tensor_epilogue_key=epilogue_key,
+            tensor_epilogue_source=epilogue_source,
             out_dtype=out_dtype,
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
             store_preact=False,
@@ -259,6 +264,7 @@ def gemm_epilogue(
         tuned=tuned,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
+        tensor_epilogue_source=epilogue_source,
         tensor_epilogue_uses_c=epilogue_arg is not None,
         alpha=alpha,
         beta=beta,

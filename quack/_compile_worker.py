@@ -4,13 +4,16 @@
 # matching the parent's tensor metadata, and compiles with COMPILE_ONLY=True.
 # Stays alive to process multiple configs (amortizes import overhead).
 
+import hashlib
 import importlib
+import importlib.util
 import os
 import pickle
 import signal
 import struct
 import sys
 import threading
+import tempfile
 import time
 
 import torch
@@ -93,6 +96,9 @@ _dtype_map = {
     "torch.bfloat16": torch.bfloat16,
     "torch.float32": torch.float32,
     "torch.float64": torch.float64,
+    "torch.float8_e4m3fn": torch.float8_e4m3fn,
+    "torch.float8_e5m2": torch.float8_e5m2,
+    "torch.float8_e8m0fnu": torch.float8_e8m0fnu,
     "torch.int32": torch.int32,
     "torch.int64": torch.int64,
     "torch.int8": torch.int8,
@@ -158,20 +164,56 @@ def main():
 
         tensor_meta = payload["tensor_meta"]
         kwargs = payload["kwargs"]
+        epilogue_marker = kwargs.get("tensor_epilogue_fn")
+        if (
+            isinstance(epilogue_marker, dict)
+            and epilogue_marker.get("__quack_epilogue_from_source__")
+        ):
+            source = epilogue_marker["source"]
+            digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+            module_name = f"quack_generated_epilogue_{digest}"
+            module_dir = os.path.join(tempfile.gettempdir(), "quack_generated_epilogues")
+            os.makedirs(module_dir, exist_ok=True)
+            module_path = os.path.join(module_dir, f"{module_name}.py")
+            if not os.path.exists(module_path):
+                with open(module_path, "w") as f:
+                    f.write(source)
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"could not load generated epilogue module {module_path}")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+            epilogue_fn = getattr(mod, epilogue_marker["name"])
+            setattr(
+                epilogue_fn,
+                "__quack_cache_key__",
+                f"epilogue:{epilogue_marker['name']}",
+            )
+            kwargs["tensor_epilogue_fn"] = epilogue_fn
         config_kwargs = payload["config_kwargs"]
+
+        def _deserialize_worker_value(value):
+            if isinstance(value, dict) and value.get("__quack_tensor_meta__"):
+                return _make_fake_tensor(value)
+            if isinstance(value, tuple):
+                return tuple(_deserialize_worker_value(v) for v in value)
+            if isinstance(value, list):
+                return [_deserialize_worker_value(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _deserialize_worker_value(v) for k, v in value.items()}
+            return value
 
         with CompileOnlyFakeTensorMode():
             fake_args = []
             for meta in tensor_meta:
-                if isinstance(meta, dict) and "shape" in meta:
-                    fake_args.append(_make_fake_tensor(meta))
-                else:
-                    fake_args.append(meta)
+                fake_args.append(_deserialize_worker_value(meta))
+            kwargs = _deserialize_worker_value(kwargs)
             try:
                 fn(*fake_args, **kwargs, **config_kwargs)
                 _send(stdout, "OK")
             except Exception as e:
-                _send(stdout, f"ERR:{e}")
+                _send(stdout, f"ERR:{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

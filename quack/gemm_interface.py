@@ -237,8 +237,20 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
-    if varlen_m or gather_A:  # Doesn't support swap_ab
+    local_reduce_active = kwargs.get("local_reduce_out", None) is not None or kwargs.get("local_reduce_feeds_main", False)
+    if varlen_m or gather_A or local_reduce_active:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    if local_reduce_active:
+        local_reduce_group = kwargs.get("local_reduce_group", None) or 32
+        local_reduce_dim = kwargs.get("local_reduce_dim", None) or 1
+        if local_reduce_dim == 1:
+            configs = [
+                conf
+                for conf in configs
+                if conf.kwargs["config"].tile_n % local_reduce_group == 0
+            ]
+        elif local_reduce_dim == 0:
+            configs = [conf for conf in configs if conf.kwargs["config"].tile_m % local_reduce_group == 0]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if device_capacity == 9:
@@ -397,6 +409,7 @@ def gemm_act_tuned(
     config: Optional[GemmConfig] = None,
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    tensor_epilogue_source: str | None = None,
     tensor_epilogue_uses_c: bool = False,
     tensor_epilogue_returns_aux: bool = False,
     alpha: float | Tensor = 1.0,
@@ -1107,6 +1120,7 @@ def gemm_act(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     tensor_epilogue_fn: Optional[Callable] = None,
     tensor_epilogue_key: Optional[str] = None,
+    tensor_epilogue_source: str | None = None,
     tensor_epilogue_uses_c: bool = False,
     tensor_epilogue_returns_aux: bool = False,
     alpha: float | Tensor = 1.0,
@@ -1207,6 +1221,7 @@ def gemm_act(
             dynamic_scheduler,
             tensor_epilogue_fn=tensor_epilogue_fn,
             tensor_epilogue_key=tensor_epilogue_key,
+            tensor_epilogue_source=tensor_epilogue_source,
             tensor_epilogue_uses_c=tensor_epilogue_uses_c,
             tensor_epilogue_returns_aux=tensor_epilogue_returns_aux,
             alpha=alpha,

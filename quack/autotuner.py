@@ -34,6 +34,22 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+def _is_expected_autotune_config_failure(e: Exception) -> bool:
+    """Return True for failures that should invalidate one config only.
+
+    Autotune candidates can be structurally invalid for a particular epilogue
+    and shape (for example, a fragment layout that cannot represent a requested
+    local-reduce group). Those should get an infinite timing while unexpected
+    programming errors still propagate.
+    """
+    if isinstance(e, (RuntimeError, MemoryError)):
+        return True
+    msg = str(e)
+    if isinstance(e, ValueError) and "expected reshaped size to be the same" in msg:
+        return True
+    return False
+
+
 def _get_current_cuda_device() -> str | None:
     """Return the physical CUDA device identifier for the current process.
 
@@ -386,22 +402,43 @@ class Autotuner:
             stream.write(data)
             stream.flush()
 
+        def _tensor_meta(arg: Tensor) -> dict[str, Any]:
+            return {
+                "__quack_tensor_meta__": True,
+                "shape": list(arg.shape),
+                "stride": list(arg.stride()),
+                "dtype": str(arg.dtype),
+            }
+
+        def _serialize_worker_value(value):
+            if isinstance(value, Tensor):
+                return _tensor_meta(value)
+            if isinstance(value, tuple):
+                return tuple(_serialize_worker_value(v) for v in value)
+            if isinstance(value, list):
+                return [_serialize_worker_value(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _serialize_worker_value(v) for k, v in value.items()}
+            return value
+
         # Serialize tensor metadata
         tensor_meta = []
         for arg in args:
-            if isinstance(arg, Tensor):
-                tensor_meta.append(
-                    {
-                        "shape": list(arg.shape),
-                        "stride": list(arg.stride()),
-                        "dtype": str(arg.dtype),
-                    }
-                )
-            else:
-                tensor_meta.append(arg)
+            tensor_meta.append(_serialize_worker_value(arg))
 
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
+        worker_kwargs = _serialize_worker_value(dict(kwargs))
+        if (
+            "tensor_epilogue_source" in worker_kwargs
+            and worker_kwargs.get("tensor_epilogue_source") is not None
+            and "tensor_epilogue_fn" in worker_kwargs
+        ):
+            worker_kwargs["tensor_epilogue_fn"] = {
+                "__quack_epilogue_from_source__": True,
+                "name": worker_kwargs.get("tensor_epilogue_key"),
+                "source": worker_kwargs["tensor_epilogue_source"],
+            }
 
         # Restrict worker subprocesses to the parent's current CUDA device.
         # Without this, all workers default to cuda:0 and their CUDA context
@@ -450,7 +487,7 @@ class Autotuner:
                         "fn_module": fn_module,
                         "fn_qualname": fn_qualname,
                         "tensor_meta": tensor_meta,
-                        "kwargs": kwargs,
+                        "kwargs": worker_kwargs,
                         "config_kwargs": config.all_kwargs(),
                     },
                 )
@@ -518,18 +555,87 @@ class Autotuner:
 
         if use_l2_cold:
             try:
+                bench_mode = os.getenv(
+                    f"{PACKAGE_NAME.upper()}_AUTOTUNE_BENCH_MODE", "torch_cudagraph"
+                )
+                if bench_mode in ("torch_profile", "torch_cudagraph"):
+                    num_iters = int(
+                        os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_TORCH_ITERS", "100")
+                    )
+                    warmup_iters = int(
+                        os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_TORCH_WARMUP", "20")
+                    )
+                    state = {"i": 0}
+                    extra_kwargs = config.all_kwargs()
+
+                    def rotating_call():
+                        idx = state["i"] % len(l2_cold_arg_sets)
+                        state["i"] += 1
+                        self.fn(
+                            *l2_cold_arg_sets[idx],
+                            **l2_cold_kwarg_sets[idx],
+                            **extra_kwargs,
+                        )
+
+                    if bench_mode == "torch_cudagraph":
+                        for _ in range(warmup_iters):
+                            rotating_call()
+                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            rotating_call()
+                        torch.cuda.synchronize()
+                        for _ in range(warmup_iters):
+                            graph.replay()
+                        torch.cuda.synchronize()
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        for _ in range(num_iters):
+                            graph.replay()
+                        end.record()
+                        torch.cuda.synchronize()
+                        ms = start.elapsed_time(end) / num_iters
+                    else:
+                        from torch._inductor.runtime.benchmarking import benchmarker
+
+                        for _ in range(warmup_iters):
+                            rotating_call()
+                        torch.cuda.synchronize()
+                        samples_ms = benchmarker.benchmark_gpu(
+                            rotating_call,
+                            benchmark_iters=num_iters,
+                            memory_warmup_iters=warmup_iters,
+                            return_mode="all",
+                            is_vetted_benchmarking=True,
+                        )
+                        ms = float(torch.median(torch.tensor(samples_ms)).item())
+                    return [ms for _ in (0.5, 0.2, 0.8)]
+
+                warmup_target_ms = float(
+                    os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_WARMUP_MS", "200")
+                )
+                n_timed_calls = int(
+                    os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_TIMED_CALLS", "200")
+                )
                 return _bench_cuda_graph_l2_rotate(
                     self.fn,
                     l2_cold_arg_sets,
                     l2_cold_kwarg_sets,
                     extra_kwargs=config.all_kwargs(),
+                    warmup_target_ms=warmup_target_ms,
+                    n_timed_calls=n_timed_calls,
                     quantiles=(0.5, 0.2, 0.8),
                 )
-            except (RuntimeError, MemoryError) as e:
-                # Narrow catch: only swallow GPU-side failures (smem
-                # overflow, kernel launch errors, OOM). Programming errors
-                # (TypeError, AssertionError, ValueError from conflict check
-                # above) propagate so the user sees them.
+            except Exception as e:
+                # Config-specific compile/runtime failures should make that
+                # config invalid, not abort the entire autotune. This includes
+                # epilogue layout mismatches such as a candidate whose fragment
+                # width cannot represent a requested local-reduce group.
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                if not _is_expected_autotune_config_failure(e):
+                    raise
                 if verbose:
                     print(f"Autotuning failed with {type(e).__name__}: {e}")
                 return [float("inf"), float("inf"), float("inf")]
@@ -640,8 +746,12 @@ class Autotuner:
                     handle = self._precompile(*args, configs=pruned_configs, **kwargs)
                     bench_start = time.time()
                     verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+                    wall_debug = os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_WALL_DEBUG", None) == "1"
                     has_hooks = self.pre_hook is not None or self.post_hook is not None
                     timings = {}
+                    wait_times = {}
+                    warm_times = {}
+                    bench_wall_times = {}
                     try:
                         _gpu_warmup()
                         # Pre-allocate cloned (args, kwargs) sets once per
@@ -671,7 +781,9 @@ class Autotuner:
                             # in the subprocess pool. The other configs keep
                             # compiling in their reader threads while we
                             # benchmark, giving us the parallel/serial overlap.
+                            wait_start = time.time()
                             handle.wait_for(i)
+                            wait_times[i] = time.time() - wait_start
                             # If the subprocess pool failed to compile this
                             # config (worker crashed, ERR: reply, etc.), warm
                             # jit_cache in-process FIRST so the bench time
@@ -686,6 +798,7 @@ class Autotuner:
                                         f"falling back to in-process compile "
                                         f"before benchmarking"
                                     )
+                                warm_start = time.time()
                                 try:
                                     current = dict(kwargs, **config.all_kwargs())
                                     self.fn(*args, **current)
@@ -693,7 +806,18 @@ class Autotuner:
                                     # _bench below will record float('inf')
                                     # if the kernel raises during the run.
                                     pass
+                                warm_times[i] = time.time() - warm_start
+                            bench_wall_start = time.time()
                             timings[config] = self._bench(*args, config=config, **kwargs)
+                            bench_wall_times[i] = time.time() - bench_wall_start
+                            if wall_debug:
+                                print(
+                                    f"[autotune-wall] config {i}: "
+                                    f"wait={wait_times.get(i, 0.0):.3f}s "
+                                    f"warm={warm_times.get(i, 0.0):.3f}s "
+                                    f"bench={bench_wall_times[i]:.3f}s "
+                                    f"median={timings[config][0]:.6f}ms"
+                                )
                     finally:
                         # Free L2-cold sets before persisting the cache so the
                         # user's subsequent .fn(...) call has full HBM.
@@ -706,6 +830,15 @@ class Autotuner:
                     if verbose:
                         for config, time_ in timings.items():
                             print(f"[{config}] -> {time_[0]:.3f}ms")
+                    if wall_debug and timings:
+                        print(
+                            "[autotune-wall-summary] "
+                            f"configs={len(timings)} "
+                            f"wait_total={sum(wait_times.values()):.3f}s "
+                            f"warm_total={sum(warm_times.values()):.3f}s "
+                            f"bench_total={sum(bench_wall_times.values()):.3f}s "
+                            f"wall_total={time.time() - bench_start:.3f}s"
+                        )
                     # Surface bench failures (configs returning inf timings)
                     # so smem-overflow / launch errors aren't silently masked.
                     n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
@@ -749,6 +882,16 @@ class Autotuner:
         pruned_configs = self.configs
         if self.early_config_prune:
             pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
+        max_configs_env = os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_MAX_CONFIGS")
+        if max_configs_env:
+            try:
+                max_configs = max(1, int(max_configs_env))
+            except ValueError:
+                raise ValueError(
+                    f"{PACKAGE_NAME.upper()}_AUTOTUNE_MAX_CONFIGS must be an integer, "
+                    f"got {max_configs_env!r}"
+                )
+            pruned_configs = pruned_configs[:max_configs]
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
