@@ -22,6 +22,20 @@ def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
     )
 
 
+def _infer_epilogue_arg_kinds(
+    a: Tensor,
+    b: Tensor,
+    epilogue_args: tuple[Tensor, ...],
+    epilogue_arg_kinds: tuple[str, ...],
+) -> tuple[str, ...]:
+    inferred = tuple(_infer_epilogue_arg_kind(a, b, arg) for arg in epilogue_args)
+    if epilogue_arg_kinds and epilogue_arg_kinds != inferred:
+        raise RuntimeError(
+            f"epilogue_arg_kinds={epilogue_arg_kinds} does not match inferred kinds {inferred!r}"
+        )
+    return inferred
+
+
 def _validate_local_reduce(
     a: Tensor, b: Tensor, out: Tensor | None, group: int | None, dim: int | None
 ) -> int | None:
@@ -163,14 +177,14 @@ def gemm_epilogue(
             main_output_transform_group=main_output_transform_group,
         )
         return out
-    if epilogue_args and len(epilogue_args) != 1:
-        raise RuntimeError("QUACK epilogue requires exactly one epilogue arg")
-    if epilogue_arg_kinds and epilogue_arg_kinds not in (("tile",), ("row",), ("col",)):
+    if epilogue_arg_kinds and len(epilogue_arg_kinds) != len(epilogue_args):
+        raise RuntimeError("epilogue_arg_kinds must match epilogue_args length")
+    if epilogue_arg_kinds and not set(epilogue_arg_kinds) <= {"tile", "row", "col"}:
         raise NotImplementedError(
-            f"QUACK GEMM epilogue supports only one tile/row/col aux tensor for now, got {epilogue_arg_kinds}"
+            f"QUACK GEMM epilogue supports only tile/row/col aux tensors, got {epilogue_arg_kinds}"
         )
-    if epilogue_arg_kinds and not epilogue_args:
-        raise RuntimeError("epilogue_arg_kinds requires an epilogue arg")
+    if epilogue_args:
+        epilogue_arg_kinds = _infer_epilogue_arg_kinds(a, b, epilogue_args, epilogue_arg_kinds)
     if epilogue_args and C is not None:
         raise NotImplementedError("QUACK epilogue arg cannot be combined with C yet")
     if epilogue_args and (alpha != 1.0 or beta != 1.0):
@@ -237,35 +251,40 @@ def gemm_epilogue(
             epilogue_key,
             out_dtype=a.dtype if out_dtype is None else out_dtype,
         )
-    epilogue_arg = epilogue_args[0] if epilogue_args else None
     if aux_out is not None and local_reduce_out is not None:
         raise NotImplementedError(
             "QUACK generic aux_out cannot be combined with local_reduce_out"
         )
-    if epilogue_arg is not None:
-        inferred_kind = _infer_epilogue_arg_kind(a, b, epilogue_arg)
-        if epilogue_arg_kinds and epilogue_arg_kinds != (inferred_kind,):
-            raise RuntimeError(
-                f"epilogue_arg_kinds={epilogue_arg_kinds} does not match inferred kind {inferred_kind!r}"
-            )
-        epilogue_arg_kind = inferred_kind
-    else:
-        epilogue_arg_kind = None
-    row_aux = epilogue_arg.squeeze(0) if epilogue_arg_kind == "row" else None
-    col_aux = epilogue_arg.squeeze(-1) if epilogue_arg_kind == "col" else None
+    row_auxes = tuple(
+        arg.squeeze(0)
+        for arg, kind in zip(epilogue_args, epilogue_arg_kinds)
+        if kind == "row"
+    )
+    col_auxes = tuple(
+        arg.squeeze(-1)
+        for arg, kind in zip(epilogue_args, epilogue_arg_kinds)
+        if kind == "col"
+    )
+    tile_auxes = tuple(
+        arg for arg, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "tile"
+    )
     postact_dtype = a.dtype if out_dtype is None else out_dtype
     preact_out, out = gemm_act(
         a,
         b,
-        C=epilogue_arg if epilogue_arg_kind == "tile" else C,
-        bias=row_aux,
-        colvec_bias=col_aux,
+        C=C,
+        bias=None,
+        colvec_bias=None,
         activation=None,
         tuned=tuned,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
         tensor_epilogue_source=epilogue_source,
-        tensor_epilogue_uses_c=epilogue_arg is not None,
+        tensor_epilogue_uses_c=bool(epilogue_args),
+        tensor_epilogue_arg_kinds=epilogue_arg_kinds,
+        tensor_epilogue_rowvec_biases=row_auxes,
+        tensor_epilogue_colvec_biases=col_auxes,
+        tensor_epilogue_tile_biases=tile_auxes,
         alpha=alpha,
         beta=beta,
         preact_out=None,

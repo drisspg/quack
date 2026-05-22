@@ -456,6 +456,85 @@ class ColVecLoad(VecLoad):
         return [tDsV, tDrV_cvt]
 
 
+class VecTupleLoad(EpiOp):
+    vec_op_cls = VecLoad
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensors = getattr(args, self.name)
+        if tensors is None:
+            return {self.name: None}
+        return {self.name: tuple(assume_stride_divisibility(tensor) for tensor in tensors)}
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        return sum(
+            (
+                self.vec_op_cls(f"{self.name}{i}").smem_bytes(
+                    tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
+                )
+                for i, tensor in enumerate(arg_tensor)
+            ),
+            EpiSmemBytes(),
+        )
+
+    def smem_struct_field(self, gemm, params):
+        annotations = {}
+        for i, tensor in enumerate(getattr(params, self.name)):
+            size = self.vec_op_cls(f"{self.name}{i}")._tile_size(gemm.cta_tile_shape_mnk)
+            annotations[f"v{i}"] = cute.struct.Align[
+                cute.struct.MemRange[tensor.element_type, size], 16
+            ]
+        storage = type(f"{self.name}Storage", (), {"__annotations__": annotations})
+        return (f"s_{self.name}", cute.struct(storage))
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        storage = getattr(storage_epi, f"s_{self.name}")
+        return tuple(
+            getattr(storage, f"v{i}").get_tensor(
+                cute.make_layout(
+                    self.vec_op_cls(f"{self.name}{i}")._tile_size(gemm.cta_tile_shape_mnk)
+                )
+            )
+            for i, _ in enumerate(getattr(params, self.name))
+        )
+
+    def needs_async_fence(self):
+        return True
+
+    def epi_m_major_score(self, arg_tensor, gemm):
+        return sum(
+            self.vec_op_cls(f"{self.name}{i}").epi_m_major_score(tensor, gemm)
+            for i, tensor in enumerate(arg_tensor)
+        )
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        states = []
+        for i, tensor in enumerate(param):
+            states.append(
+                self.vec_op_cls(f"{self.name}{i}").begin(gemm, tensor, smem_tensor[i], ctx)
+            )
+        return tuple(states)
+
+    def begin_loop(self, gemm, state, epi_coord):
+        values = []
+        for i, tensor_state in enumerate(state):
+            values.append(
+                self.vec_op_cls(f"{self.name}{i}").begin_loop(gemm, tensor_state, epi_coord)
+            )
+        return tuple(values)
+
+
+class RowVecTupleLoad(VecTupleLoad):
+    vec_op_cls = RowVecLoad
+
+
+class ColVecTupleLoad(VecTupleLoad):
+    vec_op_cls = ColVecLoad
+
+
 class TileStore(EpiOp):
     """Tile-sized output tensor stored via TMA (e.g. postact).
 
@@ -694,6 +773,136 @@ class TileLoad(EpiOp):
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         return state.tRS_rTile
+
+
+class TileTupleLoad(EpiOp):
+    def _tma_atoms_key(self):
+        return f"tma_atoms_{self.name}"
+
+    def _smem_layouts_key(self):
+        return f"epi_{self.name}_smem_layouts_staged"
+
+    def _epi_tiles_key(self):
+        return f"epi_tiles_{self.name}"
+
+    def _layout_gemm_attr(self, index):
+        return f"_tile_tuple_load_layout_{self.name}_{index}"
+
+    def _dtype_gemm_attr(self, index):
+        return f"_tile_tuple_load_dtype_{self.name}_{index}"
+
+    def param_fields(self):
+        return [
+            (self._tma_atoms_key(), object, None),
+            (self.name, object, None),
+            (self._smem_layouts_key(), object, None),
+            (self._epi_tiles_key(), object, None),
+        ]
+
+    def to_params(self, gemm, args):
+        tensors = getattr(args, self.name)
+        tma_atoms, tma_tensors, smem_layouts, epi_tiles = [], [], [], []
+        for i, tensor in enumerate(tensors):
+            setattr(gemm, self._layout_gemm_attr(i), cutlass.utils.LayoutEnum.from_tensor(tensor))
+            setattr(gemm, self._dtype_gemm_attr(i), tensor.element_type)
+            tma_atom, tma_tensor, smem_layout, epi_tile = setup_epi_tensor(
+                gemm, tensor, epi_tile=None, op_type="load", stage=gemm.epi_c_stage
+            )
+            tma_atoms.append(tma_atom)
+            tma_tensors.append(tma_tensor)
+            smem_layouts.append(smem_layout)
+            epi_tiles.append(epi_tile)
+        return {
+            self._tma_atoms_key(): tuple(tma_atoms),
+            self.name: tuple(tma_tensors),
+            self._smem_layouts_key(): tuple(smem_layouts),
+            self._epi_tiles_key(): tuple(epi_tiles),
+        }
+
+    def is_tile_load(self):
+        return True
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        return sum(
+            (
+                EpiSmemBytes(
+                    c_stage=cute.size(cute.shape(epi_tile)) * tensor.element_type.width // 8
+                )
+                for tensor in arg_tensor
+            ),
+            EpiSmemBytes(),
+        )
+
+    def smem_struct_field(self, gemm, params):
+        annotations = {}
+        for i, smem_layout in enumerate(getattr(params, self._smem_layouts_key())):
+            annotations[f"v{i}"] = cute.struct.Align[
+                cute.struct.MemRange[
+                    getattr(gemm, self._dtype_gemm_attr(i)), cute.cosize(smem_layout)
+                ],
+                gemm.buffer_align_bytes,
+            ]
+        storage = type(f"{self.name}Storage", (), {"__annotations__": annotations})
+        return (f"s_{self.name}", cute.struct(storage))
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        storage = getattr(storage_epi, f"s_{self.name}")
+        return tuple(
+            getattr(storage, f"v{i}").get_tensor(smem_layout.outer, swizzle=smem_layout.inner)
+            for i, smem_layout in enumerate(getattr(params, self._smem_layouts_key()))
+        )
+
+    def tma_atoms(self, gemm, params):
+        return list(getattr(params, self._tma_atoms_key()))
+
+    def load_g2s_copy_fn(self, gemm, params, smem_tensor, tile_coord_mnkl, varlen_manager, epi_pipeline):
+        copy_fns = []
+        for tma_atom, tensor, epi_tile, smem in zip(
+            getattr(params, self._tma_atoms_key()),
+            getattr(params, self.name),
+            getattr(params, self._epi_tiles_key()),
+            smem_tensor,
+        ):
+            copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
+                tma_atom,
+                varlen_manager.offset_batch_epi(tensor, tile_coord_mnkl[3]),
+                gemm.cta_tile_shape_mnk[:2],
+                epi_tile,
+                smem,
+                tile_coord_mnkl,
+            )
+            copy_fns.append(copy_utils.tma_producer_copy_fn(copy_tile_fn, epi_pipeline))
+        return copy_utils.chain_tma_producer_copy_fns(tuple(copy_fns))
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        assert gemm.arch in (90, 100, 120), "TileTupleLoad requires the SM90/SM100/SM120 epilogue path"
+        states = []
+        smem_load_ref = ctx.tiled_copy_t2r if const_expr(gemm.arch == 100) else gemm.tiled_mma
+        for i, smem in enumerate(smem_tensor):
+            tiled_copy_s2r, tRS_rTile, tSR_rTile, tSR_sTile = gemm.epilog_smem_load_and_partition(
+                smem_load_ref,
+                getattr(gemm, self._layout_gemm_attr(i)),
+                getattr(gemm, self._dtype_gemm_attr(i)),
+                smem,
+                ctx.tRS_rD_layout,
+                ctx.tidx,
+            )
+            states.append(_TileLoadState(tiled_copy_s2r, tRS_rTile, tSR_rTile, tSR_sTile))
+        return tuple(states)
+
+    @cute.jit
+    def load_s2r(self, gemm, param, state, stage_idx):
+        for tile_state in state:
+            cute.copy(
+                tile_state.tiled_copy_s2r,
+                tile_state.tSR_sTile[None, None, None, stage_idx],
+                tile_state.tSR_rTile,
+            )
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        return tuple(tile_state.tRS_rTile for tile_state in state)
 
 
 @cute.jit

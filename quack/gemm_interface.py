@@ -249,6 +249,18 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
                 for conf in configs
                 if conf.kwargs["config"].tile_n % local_reduce_group == 0
             ]
+            if (
+                kwargs.get("bias", None) is not None
+                or kwargs.get("local_reduce_op", None) in _SCALE_LOCAL_REDUCE_OPS
+            ):
+                configs = [
+                    conf
+                    for conf in configs
+                    if conf.kwargs["config"].tile_m == 128
+                    and conf.kwargs["config"].tile_n in (64, 128)
+                    and conf.kwargs["config"].cluster_m == 1
+                    and conf.kwargs["config"].cluster_n == 1
+                ]
         elif local_reduce_dim == 0:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_m % local_reduce_group == 0]
     if gather_A:
@@ -412,6 +424,10 @@ def gemm_act_tuned(
     tensor_epilogue_source: str | None = None,
     tensor_epilogue_uses_c: bool = False,
     tensor_epilogue_returns_aux: bool = False,
+    tensor_epilogue_arg_kinds: tuple[str, ...] = (),
+    tensor_epilogue_rowvec_biases: tuple[Tensor, ...] = (),
+    tensor_epilogue_colvec_biases: tuple[Tensor, ...] = (),
+    tensor_epilogue_tile_biases: tuple[Tensor, ...] = (),
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     colvec_bias: Optional[Tensor] = None,
@@ -462,8 +478,21 @@ def gemm_act_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
+    tensor_epilogue_rowvec_biases = tuple(
+        tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+        for tensor in tensor_epilogue_rowvec_biases
+    )
+    tensor_epilogue_tile_biases = tuple(
+        tensor.unsqueeze(0) if tensor.ndim == 2 else tensor
+        for tensor in tensor_epilogue_tile_biases
+    )
     if colvec_bias is not None and colvec_bias.ndim == 1 and not varlen_m:
         colvec_bias = colvec_bias.unsqueeze(0)  # (L, M)
+    if not varlen_m:
+        tensor_epilogue_colvec_biases = tuple(
+            tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+            for tensor in tensor_epilogue_colvec_biases
+        )
     if local_reduce_out is not None or local_reduce_feeds_main:
         if varlen_m:
             raise NotImplementedError("local reduce with varlen_m is not supported yet")
@@ -506,6 +535,23 @@ def gemm_act_tuned(
         tensor_epilogue_key=tensor_epilogue_key,
         tensor_epilogue_uses_c=tensor_epilogue_uses_c,
         tensor_epilogue_returns_aux=tensor_epilogue_returns_aux,
+        tensor_epilogue_arg_kinds=(
+            tuple(
+                {"row": "col", "col": "row"}.get(kind, kind)
+                for kind in tensor_epilogue_arg_kinds
+            )
+            if config.swap_ab
+            else tensor_epilogue_arg_kinds
+        ),
+        tensor_epilogue_rowvec_biases=(
+            tensor_epilogue_rowvec_biases if not config.swap_ab else tensor_epilogue_colvec_biases
+        ),
+        tensor_epilogue_colvec_biases=(
+            tensor_epilogue_colvec_biases if not config.swap_ab else tensor_epilogue_rowvec_biases
+        ),
+        tensor_epilogue_tile_biases=tuple(
+            tensor if not config.swap_ab else tensor.mT for tensor in tensor_epilogue_tile_biases
+        ),
         alpha=alpha,
         beta=beta,
         local_reduce_out=local_reduce_out,
@@ -1123,6 +1169,10 @@ def gemm_act(
     tensor_epilogue_source: str | None = None,
     tensor_epilogue_uses_c: bool = False,
     tensor_epilogue_returns_aux: bool = False,
+    tensor_epilogue_arg_kinds: tuple[str, ...] = (),
+    tensor_epilogue_rowvec_biases: tuple[Tensor, ...] = (),
+    tensor_epilogue_colvec_biases: tuple[Tensor, ...] = (),
+    tensor_epilogue_tile_biases: tuple[Tensor, ...] = (),
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     colvec_bias: Optional[Tensor] = None,
@@ -1224,6 +1274,10 @@ def gemm_act(
             tensor_epilogue_source=tensor_epilogue_source,
             tensor_epilogue_uses_c=tensor_epilogue_uses_c,
             tensor_epilogue_returns_aux=tensor_epilogue_returns_aux,
+            tensor_epilogue_arg_kinds=tensor_epilogue_arg_kinds,
+            tensor_epilogue_rowvec_biases=tensor_epilogue_rowvec_biases,
+            tensor_epilogue_colvec_biases=tensor_epilogue_colvec_biases,
+            tensor_epilogue_tile_biases=tensor_epilogue_tile_biases,
             alpha=alpha,
             beta=beta,
             colvec_bias=colvec_bias,
