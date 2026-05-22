@@ -28,6 +28,7 @@ from torch import Tensor
 import triton
 
 from . import __version__
+from ._compile_payload import make_epilogue_source_marker, serialize_worker_value
 
 
 PACKAGE_NAME = "quack"
@@ -402,43 +403,20 @@ class Autotuner:
             stream.write(data)
             stream.flush()
 
-        def _tensor_meta(arg: Tensor) -> dict[str, Any]:
-            return {
-                "__quack_tensor_meta__": True,
-                "shape": list(arg.shape),
-                "stride": list(arg.stride()),
-                "dtype": str(arg.dtype),
-            }
-
-        def _serialize_worker_value(value):
-            if isinstance(value, Tensor):
-                return _tensor_meta(value)
-            if isinstance(value, tuple):
-                return tuple(_serialize_worker_value(v) for v in value)
-            if isinstance(value, list):
-                return [_serialize_worker_value(v) for v in value]
-            if isinstance(value, dict):
-                return {k: _serialize_worker_value(v) for k, v in value.items()}
-            return value
-
-        # Serialize tensor metadata
-        tensor_meta = []
-        for arg in args:
-            tensor_meta.append(_serialize_worker_value(arg))
+        tensor_meta = [serialize_worker_value(arg) for arg in args]
 
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
-        worker_kwargs = _serialize_worker_value(dict(kwargs))
+        worker_kwargs = serialize_worker_value(dict(kwargs))
         if (
             "tensor_epilogue_source" in worker_kwargs
             and worker_kwargs.get("tensor_epilogue_source") is not None
             and "tensor_epilogue_fn" in worker_kwargs
         ):
-            worker_kwargs["tensor_epilogue_fn"] = {
-                "__quack_epilogue_from_source__": True,
-                "name": worker_kwargs.get("tensor_epilogue_key"),
-                "source": worker_kwargs["tensor_epilogue_source"],
-            }
+            worker_kwargs["tensor_epilogue_fn"] = make_epilogue_source_marker(
+                worker_kwargs.get("tensor_epilogue_key"),
+                worker_kwargs["tensor_epilogue_source"],
+            )
 
         # Restrict worker subprocesses to the parent's current CUDA device.
         # Without this, all workers default to cuda:0 and their CUDA context
