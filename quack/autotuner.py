@@ -430,21 +430,16 @@ class Autotuner:
             stream.write(data)
             stream.flush()
 
-        tensor_meta = [serialize_worker_value(arg) for arg in args]
+        serialized_args = [serialize_worker_value(arg) for arg in args]
 
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
-        worker_kwargs = serialize_worker_value(dict(kwargs))
         epilogue_fn = kwargs.get("tensor_epilogue_fn")
-        if (
-            "tensor_epilogue_source" in worker_kwargs
-            and worker_kwargs.get("tensor_epilogue_source") is not None
-            and epilogue_fn is not None
-        ):
+        epilogue_source = kwargs.get("tensor_epilogue_source")
+        worker_kwargs = serialize_worker_value(dict(kwargs))
+        if epilogue_source is not None and epilogue_fn is not None:
             worker_kwargs["tensor_epilogue_fn"] = make_epilogue_source_marker(
-                epilogue_fn.__name__,
-                worker_kwargs.get("tensor_epilogue_key"),
-                worker_kwargs["tensor_epilogue_source"],
+                epilogue_fn.__name__, epilogue_source
             )
 
         # Restrict worker subprocesses to the parent's current CUDA device.
@@ -493,7 +488,7 @@ class Autotuner:
                     {
                         "fn_module": fn_module,
                         "fn_qualname": fn_qualname,
-                        "tensor_meta": tensor_meta,
+                        "args": serialized_args,
                         "kwargs": worker_kwargs,
                         "config_kwargs": config.all_kwargs(),
                     },

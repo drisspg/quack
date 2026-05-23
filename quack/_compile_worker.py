@@ -14,11 +14,7 @@ import threading
 import time
 
 import quack.cache
-from quack._compile_payload import (
-    deserialize_worker_value,
-    is_epilogue_source_marker,
-    load_epilogue_from_source,
-)
+from quack._compile_payload import deserialize_worker_value
 from quack.cache import CompileOnlyFakeTensorMode
 
 
@@ -139,15 +135,12 @@ def main():
             fn_cache[fn_key] = getattr(obj, "fn", obj)
         fn = fn_cache[fn_key]
 
-        tensor_meta = payload["tensor_meta"]
+        serialized_args = payload["args"]
         kwargs = payload["kwargs"]
-        epilogue_marker = kwargs.get("tensor_epilogue_fn")
-        if is_epilogue_source_marker(epilogue_marker):
-            kwargs["tensor_epilogue_fn"] = load_epilogue_from_source(epilogue_marker)
         config_kwargs = payload["config_kwargs"]
 
         with CompileOnlyFakeTensorMode():
-            fake_args = [deserialize_worker_value(meta) for meta in tensor_meta]
+            fake_args = [deserialize_worker_value(arg) for arg in serialized_args]
             kwargs = deserialize_worker_value(kwargs)
             try:
                 fn(*fake_args, **kwargs, **config_kwargs)

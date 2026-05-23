@@ -40,10 +40,13 @@ def test_autotune_key_serializes_nested_tensor_metadata():
         {"A": torch.empty((4, 5), dtype=torch.bfloat16), "aux": aux, "mode": "row"}
     )
 
+    assert len(key) == 5
     assert "float16" in key[0]
     assert "(2, 3)" in key[0]
-    assert "row" == key[1]
-    assert "torch.bfloat16" in key[-1]
+    assert key[1] == "row"
+    assert key[2] == "torch.Size([4, 5])"
+    assert key[3] == "[2, 1]"
+    assert key[4] == "torch.bfloat16"
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,26 @@ def _empty_k_matmul_into(
 
 _LOCAL_REDUCE_OPS = {"sum", "amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale", "copy"}
 _SCALE_LOCAL_REDUCE_OPS = {"mx_e8m0_scale", "nvfp4_e4m3_scale"}
+_GEMM_ACT_BASE_AUTOTUNE_KEYS = ["activation", "dynamic_scheduler", "concat_layout"]
+_TENSOR_EPILOGUE_AUTOTUNE_KEYS = [
+    "tensor_epilogue_key",
+    "tensor_epilogue_uses_c",
+    "tensor_epilogue_returns_aux",
+    "tensor_epilogue_arg_kinds",
+    "tensor_epilogue_rowvec_biases",
+    "tensor_epilogue_colvec_biases",
+    "tensor_epilogue_tile_biases",
+]
+_LOCAL_REDUCE_AUTOTUNE_KEYS = [
+    "local_reduce_group",
+    "local_reduce_dim",
+    "local_reduce_op",
+    "local_reduce_scale",
+    "local_reduce_max_power",
+    "local_reduce_feeds_main",
+    "local_reduce_source_from_epilogue",
+]
+_MAIN_OUTPUT_TRANSFORM_AUTOTUNE_KEYS = ["main_output_transform_group"]
 
 
 def _validate_local_reduce_op_and_dtype(
@@ -438,24 +458,10 @@ def gemm_tuned(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=[
-        "activation",
-        "dynamic_scheduler",
-        "concat_layout",
-        "tensor_epilogue_key",
-        "tensor_epilogue_uses_c",
-        "tensor_epilogue_returns_aux",
-        "tensor_epilogue_arg_kinds",
-        "tensor_epilogue_rowvec_biases",
-        "tensor_epilogue_colvec_biases",
-        "tensor_epilogue_tile_biases",
-        "local_reduce_group",
-        "local_reduce_dim",
-        "local_reduce_op",
-        "local_reduce_scale",
-        "local_reduce_max_power",
-        "local_reduce_feeds_main",
-        "local_reduce_source_from_epilogue",
-        "main_output_transform_group",
+        *_GEMM_ACT_BASE_AUTOTUNE_KEYS,
+        *_TENSOR_EPILOGUE_AUTOTUNE_KEYS,
+        *_LOCAL_REDUCE_AUTOTUNE_KEYS,
+        *_MAIN_OUTPUT_TRANSFORM_AUTOTUNE_KEYS,
     ],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
