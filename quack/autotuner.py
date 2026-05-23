@@ -341,6 +341,33 @@ class Autotuner:
         self.fn = fn
         self._do_bench = do_bench
 
+    @staticmethod
+    def _key_arg(value):
+        if isinstance(value, Tensor):
+            return (
+                "Tensor",
+                tuple(value.shape),
+                tuple(s if s in {0, 1} else 2 for s in value.stride()),
+                str(value.dtype),
+            )
+        if isinstance(value, tuple):
+            return tuple(Autotuner._key_arg(v) for v in value)
+        if isinstance(value, list):
+            return [Autotuner._key_arg(v) for v in value]
+        if isinstance(value, dict):
+            return tuple(sorted((k, Autotuner._key_arg(v)) for k, v in value.items()))
+        return value
+
+    def _make_cache_key(self, all_args):
+        _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
+        key = [str(self._key_arg(_args[name])) for name in self.keys if name in _args]
+        for _, arg in _args.items():
+            if isinstance(arg, Tensor):
+                key.append(str(arg.shape))
+                key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
+                key.append(str(arg.dtype))
+        return tuple(key)
+
     @cached_property
     def do_bench(self):
         if self._do_bench is None:
@@ -408,12 +435,14 @@ class Autotuner:
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
         worker_kwargs = serialize_worker_value(dict(kwargs))
+        epilogue_fn = kwargs.get("tensor_epilogue_fn")
         if (
             "tensor_epilogue_source" in worker_kwargs
             and worker_kwargs.get("tensor_epilogue_source") is not None
-            and "tensor_epilogue_fn" in worker_kwargs
+            and epilogue_fn is not None
         ):
             worker_kwargs["tensor_epilogue_fn"] = make_epilogue_source_marker(
+                epilogue_fn.__name__,
                 worker_kwargs.get("tensor_epilogue_key"),
                 worker_kwargs["tensor_epilogue_source"],
             )
@@ -691,17 +720,7 @@ class Autotuner:
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
-            all_args = {**self.nargs, **kwargs}
-            _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
-            # Need "str" to make it json-serializable
-            key = [str(_args[key]) for key in self.keys if key in _args]
-            for _, arg in _args.items():
-                if isinstance(arg, Tensor):
-                    key.append(str(arg.shape))
-                    # If stride != 0, 1, we just cache it as 2
-                    key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
-                    key.append(str(arg.dtype))
-            key = tuple(key)
+            key = self._make_cache_key({**self.nargs, **kwargs})
             if key not in self.cache:
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)

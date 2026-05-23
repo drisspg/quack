@@ -10,6 +10,7 @@ from torch import Tensor
 
 from quack.gemm_config import GemmConfig, get_all_configs
 
+from quack._compile_payload import set_epilogue_source_cache_key
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_dispatch
@@ -68,6 +69,28 @@ def _validate_local_reduce_op_and_dtype(
         )
 
 
+def _is_safe_local_reduce_config(config: GemmConfig) -> bool:
+    return (
+        not config.swap_ab
+        and config.tile_m == 128
+        and config.tile_n in (64, 128)
+        and config.cluster_m == 1
+        and config.cluster_n == 1
+    )
+
+
+def _local_reduce_tile_n(config: GemmConfig, group: int) -> int:
+    if _is_safe_local_reduce_config(config) and config.tile_n % group == 0:
+        return config.tile_n
+    for tile_n in (128, 64):
+        if tile_n % group == 0:
+            return tile_n
+    raise NotImplementedError(
+        "local N-group reductions currently require a safe tile_n in (64, 128) "
+        f"divisible by group, got group={group}"
+    )
+
+
 def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> GemmConfig:
     if group <= 0 or group & (group - 1) != 0:
         raise NotImplementedError(
@@ -76,27 +99,31 @@ def _force_local_reduce_config(config: GemmConfig, group: int, dim: int) -> Gemm
     if config.swap_ab:
         raise NotImplementedError("local reduce does not support swap_ab")
     if dim == 1:
-        # Keep the selected/default GEMM tile when possible. Forcing tiny
-        # tile_n=max(32, group) preserves correctness but is very slow on
-        # large GEMMs; grouped reductions only require that the tile-N extent
-        # is divisible by the logical group size.
-        tile_n = config.tile_n if config.tile_n % group == 0 else max(32, group)
-        if tile_n % group != 0:
-            raise NotImplementedError(
-                f"local N-group reduce requires tile_n divisible by group, got tile_n={tile_n}, group={group}"
-            )
-        return replace(config, tile_n=tile_n, cluster_n=1, swap_ab=False)
+        return replace(
+            config,
+            tile_m=128,
+            tile_n=_local_reduce_tile_n(config, group),
+            cluster_m=1,
+            cluster_n=1,
+            swap_ab=False,
+        )
     if dim == 0:
-        tile_m = 128
         if group > 16:
             raise NotImplementedError(
                 "local M-group reductions currently support only group sizes <= 16"
             )
-        if tile_m % group != 0:
+        if 128 % group != 0:
             raise NotImplementedError(
-                f"local M-group reduce requires tile_m divisible by group, got tile_m={tile_m}, group={group}"
+                f"local M-group reduce requires tile_m divisible by group, got tile_m=128, group={group}"
             )
-        return replace(config, tile_m=tile_m, cluster_m=2, swap_ab=False)
+        return replace(
+            config,
+            tile_m=128,
+            tile_n=config.tile_n if _is_safe_local_reduce_config(config) else 128,
+            cluster_m=1,
+            cluster_n=1,
+            swap_ab=False,
+        )
     raise NotImplementedError(f"unsupported local_reduce_dim={dim}")
 
 
@@ -237,7 +264,9 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
-    local_reduce_active = kwargs.get("local_reduce_out", None) is not None or kwargs.get("local_reduce_feeds_main", False)
+    local_reduce_active = kwargs.get("local_reduce_out", None) is not None or kwargs.get(
+        "local_reduce_feeds_main", False
+    )
     if varlen_m or gather_A or local_reduce_active:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if local_reduce_active:
@@ -255,29 +284,20 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
             configs = [
                 conf
                 for conf in configs
-                if conf.kwargs["config"].tile_n % local_reduce_group == 0
+                if _is_safe_local_reduce_config(conf.kwargs["config"])
+                and conf.kwargs["config"].tile_n % local_reduce_group == 0
             ]
-            if (
-                kwargs.get("bias", None) is not None
-                or kwargs.get("local_reduce_op", None) in _SCALE_LOCAL_REDUCE_OPS
-                or local_reduce_group >= 16
-            ):
+            if kwargs.get("local_reduce_op", None) in _SCALE_LOCAL_REDUCE_OPS:
                 configs = [
-                    conf
-                    for conf in configs
-                    if conf.kwargs["config"].tile_m == 128
-                    and conf.kwargs["config"].tile_n in (64, 128)
-                    and conf.kwargs["config"].cluster_m == 1
-                    and conf.kwargs["config"].cluster_n == 1
+                    conf for conf in configs if local_reduce_group < conf.kwargs["config"].tile_n
                 ]
         elif local_reduce_dim == 0:
             configs = [
                 conf
                 for conf in configs
-                if conf.kwargs["config"].tile_m == 128
-                and conf.kwargs["config"].tile_n in (64, 128)
-                and conf.kwargs["config"].cluster_m == 1
-                and conf.kwargs["config"].cluster_n == 1
+                if _is_safe_local_reduce_config(conf.kwargs["config"])
+                and local_reduce_group <= 16
+                and conf.kwargs["config"].tile_m % local_reduce_group == 0
             ]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
@@ -292,7 +312,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["dynamic_scheduler"],
+    key=["dynamic_scheduler", "concat_layout"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_tuned(
@@ -417,7 +437,26 @@ def gemm_tuned(
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["activation", "dynamic_scheduler"],
+    key=[
+        "activation",
+        "dynamic_scheduler",
+        "concat_layout",
+        "tensor_epilogue_key",
+        "tensor_epilogue_uses_c",
+        "tensor_epilogue_returns_aux",
+        "tensor_epilogue_arg_kinds",
+        "tensor_epilogue_rowvec_biases",
+        "tensor_epilogue_colvec_biases",
+        "tensor_epilogue_tile_biases",
+        "local_reduce_group",
+        "local_reduce_dim",
+        "local_reduce_op",
+        "local_reduce_scale",
+        "local_reduce_max_power",
+        "local_reduce_feeds_main",
+        "local_reduce_source_from_epilogue",
+        "main_output_transform_group",
+    ],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_act_tuned(
@@ -444,6 +483,7 @@ def gemm_act_tuned(
     tensor_epilogue_rowvec_biases: tuple[Tensor, ...] = (),
     tensor_epilogue_colvec_biases: tuple[Tensor, ...] = (),
     tensor_epilogue_tile_biases: tuple[Tensor, ...] = (),
+    concat_layout: tuple | str | None = None,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     colvec_bias: Optional[Tensor] = None,
@@ -459,6 +499,8 @@ def gemm_act_tuned(
 ) -> None:
     if config is None:
         config = default_config(A.device)
+    if tensor_epilogue_fn is not None and tensor_epilogue_source is not None:
+        set_epilogue_source_cache_key(tensor_epilogue_fn, tensor_epilogue_source)
     if local_reduce_out is not None or local_reduce_feeds_main:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
@@ -472,6 +514,7 @@ def gemm_act_tuned(
             raise NotImplementedError(
                 "QUACK scale local_reduce_op requires group smaller than the selected tile_n"
             )
+    concat_layout = _parse_concat_layout(concat_layout)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
@@ -518,6 +561,12 @@ def gemm_act_tuned(
             )
         if local_reduce_out is not None and local_reduce_out.ndim == 2:
             local_reduce_out = local_reduce_out.unsqueeze(0)
+    _swap_map = {"A": "B", "B": "A", "mRowVecBroadcast": "mColVecBroadcast"}
+    concat_layout = (
+        tuple(_swap_map.get(k, k) for k in concat_layout)
+        if config.swap_ab and concat_layout
+        else concat_layout
+    )
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -547,14 +596,14 @@ def gemm_act_tuned(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
+        concat_layout=concat_layout,
         tensor_epilogue_fn=tensor_epilogue_fn,
         tensor_epilogue_key=tensor_epilogue_key,
         tensor_epilogue_uses_c=tensor_epilogue_uses_c,
         tensor_epilogue_returns_aux=tensor_epilogue_returns_aux,
         tensor_epilogue_arg_kinds=(
             tuple(
-                {"row": "col", "col": "row"}.get(kind, kind)
-                for kind in tensor_epilogue_arg_kinds
+                {"row": "col", "col": "row"}.get(kind, kind) for kind in tensor_epilogue_arg_kinds
             )
             if config.swap_ab
             else tensor_epilogue_arg_kinds
@@ -1212,9 +1261,7 @@ def gemm_act(
                 f"unsupported main_output_transform={main_output_transform!r}"
             )
         if tensor_epilogue_fn is None:
-            raise NotImplementedError(
-                "shape-changing main epilogues require tensor_epilogue_fn"
-            )
+            raise NotImplementedError("shape-changing main epilogues require tensor_epilogue_fn")
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
@@ -1261,9 +1308,7 @@ def gemm_act(
         return preact_out, postact_out
     if A.numel() == 0:
         if tensor_epilogue_fn is not None:
-            raise NotImplementedError(
-                "K=0 tensor epilogues are not supported by the fast path"
-            )
+            raise NotImplementedError("K=0 tensor epilogues are not supported by the fast path")
         if preact_out is not None:
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)
@@ -1294,6 +1339,7 @@ def gemm_act(
             tensor_epilogue_rowvec_biases=tensor_epilogue_rowvec_biases,
             tensor_epilogue_colvec_biases=tensor_epilogue_colvec_biases,
             tensor_epilogue_tile_biases=tensor_epilogue_tile_biases,
+            concat_layout=concat_str,
             alpha=alpha,
             beta=beta,
             colvec_bias=colvec_bias,
@@ -1319,6 +1365,7 @@ def gemm_act(
             bias,
             activation,
             cu_seqlens_m,
+            cu_seqlens_k,
             A_idx,
             dynamic_scheduler,
             tuned,
@@ -1334,6 +1381,7 @@ def gemm_act(
             bias,
             activation,
             cu_seqlens_m,
+            cu_seqlens_k,
             A_idx,
             dynamic_scheduler,
             tuned,
@@ -1348,7 +1396,7 @@ gemm_gated = gemm_act
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? cu_seqlens_k=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1359,7 +1407,8 @@ def gemm_act_out(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -1374,7 +1423,7 @@ def gemm_act_out(
         bias,
         activation,
         cu_seqlens_m,
-        None,
+        cu_seqlens_k,
         A_idx,
         dynamic_scheduler,
     )
@@ -1387,7 +1436,8 @@ def gemm_act_ref(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Activation = None,
     cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
@@ -1398,11 +1448,24 @@ def gemm_act_ref(
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
         preact = gemm_ref(
-            A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+            A,
+            B,
+            bias=bias,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            concat_layout=concat_layout,
         )
     else:
         preact = gemm_add_ref(
-            A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+            A,
+            B,
+            C,
+            bias=bias,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            concat_layout=concat_layout,
         )
     if is_gated:
         # With concat=("B",), gemm_ref already interleaves the output columns,
@@ -1691,7 +1754,7 @@ def gemm_symmetric(
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
-    key=["activation", "dynamic_scheduler"],
+    key=["activation", "dynamic_scheduler", "concat_layout"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_gated_tuned(
@@ -1705,7 +1768,8 @@ def gemm_gated_tuned(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: GatedActivation = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
@@ -1713,12 +1777,14 @@ def gemm_gated_tuned(
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
+    varlen_k = cu_seqlens_k is not None
+    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not varlen_m:
+    if A.ndim == 2 and not (varlen_m or varlen_k):
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
+    B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
+    if B.ndim == 2 and not varlen_k:
         B = B.unsqueeze(0)  # (1, N, K)
     if C is not None and C.ndim == 2 and not varlen_m:
         C = C.unsqueeze(0)  # (1, M, N)
@@ -1766,6 +1832,7 @@ def gemm_gated_tuned(
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
         concat_layout=concat_layout,
@@ -1879,7 +1946,7 @@ def gemm_dgated_tuned(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? cu_seqlens_k=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1890,7 +1957,8 @@ def gemm_gated_out(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: GatedActivation = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: Optional[str] = None,
@@ -1906,6 +1974,7 @@ def gemm_gated_out(
         bias,
         activation,
         cu_seqlens_m,
+        cu_seqlens_k,
         A_idx,
         dynamic_scheduler,
         concat_layout=_parse_concat_layout(concat_layout),

@@ -4,6 +4,7 @@ import os
 import torch
 from torch import Tensor
 
+from quack._compile_payload import set_epilogue_source_cache_key
 from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
 from quack.gemm_interface import _validate_local_reduce_op_and_dtype, gemm_act
 
@@ -99,11 +100,12 @@ def gemm_epilogue(
     epilogue_source: str | None = None,
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
+    concat_layout: tuple[str, ...] | None = None,
 ) -> Tensor:
     if tuned is None:
         tuned = os.getenv("QUACK_GEMM_EPILOGUE_TUNED", "0") == "1"
     if epilogue_source is not None:
-        setattr(epilogue_fn, "__quack_cache_key__", f"epilogue:{epilogue_key}")
+        set_epilogue_source_cache_key(epilogue_fn, epilogue_source)
     if local_reduce_out is not None:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = _validate_local_reduce(
@@ -175,6 +177,7 @@ def gemm_epilogue(
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
             main_output_transform=main_output_transform,
             main_output_transform_group=main_output_transform_group,
+            concat_layout=concat_layout,
         )
         return out
     if epilogue_arg_kinds and len(epilogue_arg_kinds) != len(epilogue_args):
@@ -233,6 +236,7 @@ def gemm_epilogue(
             store_preact=False,
             main_output_transform=main_output_transform,
             main_output_transform_group=main_output_transform_group,
+            concat_layout=concat_layout,
         )
         return out
     if scale_a is not None or scale_b is not None:

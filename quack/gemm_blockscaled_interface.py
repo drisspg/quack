@@ -267,37 +267,7 @@ def mxfp8_scaled_mm_epilogue(
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> Tensor:
-    assert A.dtype == torch.float8_e4m3fn, f"A dtype must be float8_e4m3fn, got {A.dtype}"
-    assert B.dtype == torch.float8_e4m3fn, f"B dtype must be float8_e4m3fn, got {B.dtype}"
-    assert A_scale.dtype == torch.float8_e8m0fnu
-    assert B_scale.dtype == torch.float8_e8m0fnu
-    was_2d = A.dim() == 2
-    A3 = _as_3d(A, A.dim())
-    B3 = _as_3d(B, B.dim()).mT
-    l, m, k = A3.shape
-    l2, n, k2 = B3.shape
-    assert l == l2, f"batch mismatch: A={l}, B={l2}"
-    assert k == k2, f"K mismatch: A K={k}, B K={k2}"
-    assert k % _SF_VEC_SIZE == 0, f"K ({k}) must be divisible by {_SF_VEC_SIZE}"
-    assert A3.stride(-1) == 1, "A must be K-contiguous (stride 1 on K)"
-    assert B3.stride(-1) == 1, "B must be K-contiguous on its K axis"
-    A3_c = A3.contiguous()
-    B3_c = B3.contiguous()
-    mA = A3_c.permute(1, 2, 0)
-    mB = B3_c.permute(1, 2, 0)
-    sf_k = k // _SF_VEC_SIZE
-    sfa = scale_view_for_kernel(
-        A_scale.contiguous().view(l, ceil_div(m, 128), ceil_div(sf_k, 4), 512),
-        m,
-        sf_k,
-        l,
-    )
-    sfb = scale_view_for_kernel(
-        B_scale.contiguous().view(l, ceil_div(n, 128), ceil_div(sf_k, 4), 512),
-        n,
-        sf_k,
-        l,
-    )
+    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
     out_shape = (m, n) if was_2d else (l, m, n)
     out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     mD = (out.unsqueeze(0) if was_2d else out).permute(1, 2, 0)

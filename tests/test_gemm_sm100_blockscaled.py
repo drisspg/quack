@@ -18,6 +18,10 @@ from quack.gemm_default_epi import GemmDefaultSm100
 from quack.mx_utils import to_blocked
 
 
+def _identity_epilogue(x):
+    return x
+
+
 def _skip_if_not_sm100():
     major = torch.cuda.get_device_properties(0).major
     if major < 10:
@@ -609,6 +613,36 @@ def test_mxfp8_interface(shape_mnk, batched):
     # High-level quantize+gemm convenience fn
     out2 = mxfp8_gemm_quantize(A_hp, W_hp)
     assert torch.equal(out, out2)
+
+
+def test_mxfp8_scaled_mm_epilogue_reuses_interface_scale_layout():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import (
+        mxfp8_gemm,
+        mxfp8_quantize,
+        mxfp8_scaled_mm_epilogue,
+    )
+
+    M, N, K = 256, 256, 256
+    torch.manual_seed(0)
+    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    B_q, B_sc = W_q.mT, W_sc.mT
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
+        _identity_epilogue,
+        "identity",
+        **config,
+    )
+    ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, **config)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("a_major", ["k", "m"])

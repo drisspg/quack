@@ -12,6 +12,8 @@ from quack.gemm_interface import (
     gemm_add,
     gemm_add_ref,
     gemm_add_inplace,
+    gemm_act,
+    gemm_act_ref,
 )
 
 sm100_tma_gather_only = pytest.mark.skipif(
@@ -147,6 +149,36 @@ def test_gemm_varlen_k_tma_gather_matches_cpasync(
     assert (out_tma - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
     assert (out_cpasync - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
     torch.testing.assert_close(out_tma, out_cpasync, atol=3e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_act_varlen_k(activation):
+    device = "cuda"
+    torch.random.manual_seed(42)
+    num_groups = 3
+    m, n = 128, 256
+    out_n = n * 2 if activation == "swiglu" else n
+    seq_lens = torch.tensor([64, 128, 64], dtype=torch.int32)
+    cu_seqlens_k = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+    ).to(device)
+    total_k = cu_seqlens_k[-1].item()
+    A = torch.randn((m, total_k), device=device, dtype=torch.bfloat16).T.contiguous().T
+    B = torch.randn((total_k, out_n), device=device, dtype=torch.bfloat16) / math.sqrt(total_k)
+    C = torch.randn((num_groups, m, out_n), device=device, dtype=torch.bfloat16)
+
+    preact, postact = gemm_act(
+        A, B, C, activation=activation, cu_seqlens_k=cu_seqlens_k, tuned=False
+    )
+    preact_ref, postact_ref = gemm_act_ref(
+        A.float(), B.float(), C.float(), activation=activation, cu_seqlens_k=cu_seqlens_k
+    )
+    preact_pt, postact_pt = gemm_act_ref(A, B, C, activation=activation, cu_seqlens_k=cu_seqlens_k)
+
+    assert preact.shape == (num_groups, m, out_n)
+    assert postact.shape == (num_groups, m, n)
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
 @pytest.mark.parametrize("permute_batch", [False, True])

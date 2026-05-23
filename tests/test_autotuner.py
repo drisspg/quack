@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from quack.autotuner import AutotuneConfig
+from quack.autotuner import AutotuneConfig, autotune
 
 
 def test_autotune_config_supports_multi_kwarg_hash_and_equality():
@@ -22,6 +22,28 @@ def test_autotune_config_supports_multi_kwarg_hash_and_equality():
     timings = {config_a: 1.25, config_c: 2.5}
     assert timings[config_b] == 1.25
     assert len({config_a, config_b, config_c}) == 2
+
+
+def test_autotune_key_serializes_nested_tensor_metadata():
+    import torch
+
+    @autotune(
+        configs=[AutotuneConfig(config="a"), AutotuneConfig(config="b")],
+        key=["aux", "mode"],
+        cache_results=False,
+    )
+    def tuned(A, aux=(), mode=None, config=None):
+        pass
+
+    aux = (torch.empty_strided((2, 3), (1, 2), dtype=torch.float16),)
+    key = tuned._make_cache_key(
+        {"A": torch.empty((4, 5), dtype=torch.bfloat16), "aux": aux, "mode": "row"}
+    )
+
+    assert "float16" in key[0]
+    assert "(2, 3)" in key[0]
+    assert "row" == key[1]
+    assert "torch.bfloat16" in key[-1]
 
 
 # ---------------------------------------------------------------------------
