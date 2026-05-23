@@ -242,7 +242,15 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if local_reduce_active:
         local_reduce_group = kwargs.get("local_reduce_group", None) or 32
-        local_reduce_dim = kwargs.get("local_reduce_dim", None) or 1
+        local_reduce_dim = kwargs.get("local_reduce_dim", None)
+        if local_reduce_dim is None:
+            A = kwargs.get("A", None)
+            B = kwargs.get("B", None)
+            local_reduce_out = kwargs.get("local_reduce_out", None)
+            if A is not None and B is not None and local_reduce_out is not None:
+                local_reduce_dim = 0 if local_reduce_out.shape[-1] == B.shape[-1] else 1
+            else:
+                local_reduce_dim = 1
         if local_reduce_dim == 1:
             configs = [
                 conf
@@ -263,7 +271,14 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
                     and conf.kwargs["config"].cluster_n == 1
                 ]
         elif local_reduce_dim == 0:
-            configs = [conf for conf in configs if conf.kwargs["config"].tile_m % local_reduce_group == 0]
+            configs = [
+                conf
+                for conf in configs
+                if conf.kwargs["config"].tile_m == 128
+                and conf.kwargs["config"].tile_n in (64, 128)
+                and conf.kwargs["config"].cluster_m == 1
+                and conf.kwargs["config"].cluster_n == 1
+            ]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if device_capacity == 9:
