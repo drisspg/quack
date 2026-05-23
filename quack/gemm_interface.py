@@ -252,6 +252,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
             if (
                 kwargs.get("bias", None) is not None
                 or kwargs.get("local_reduce_op", None) in _SCALE_LOCAL_REDUCE_OPS
+                or local_reduce_group >= 16
             ):
                 configs = [
                     conf
