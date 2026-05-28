@@ -140,6 +140,15 @@ def _as_3d(x: Tensor, ndim_in: int) -> Tensor:
     return x
 
 
+def _blocked_scale_1d_view(scale: Tensor, mn: int, sf_k: int, l: int) -> Tensor:
+    rm = ceil_div(mn, 128)
+    rk = ceil_div(sf_k, 4)
+    assert scale.numel() == l * rm * rk * 512, (
+        f"blocked scale size: expected {l * rm * rk * 512}, got {scale.numel()}"
+    )
+    return scale.contiguous().view(l, rm, rk, 512)
+
+
 def _to_kernel_layout(
     A: Tensor,
     B: Tensor,
@@ -170,18 +179,28 @@ def _to_kernel_layout(
         "B must be K-contiguous on its K axis (pass .mT of an (N,K) row-major tensor)"
     )
     sf_k = k // _SF_VEC_SIZE
-    as3 = _as_3d(A_scale, A_scale.dim())  # expected (l, m, sf_k) K-contig row-major
-    bs3 = _as_3d(B_scale, B_scale.dim()).mT  # (l, n, sf_k) K-contig (view) from (l, sf_k, n)
-    assert as3.stride(-1) == 1, "A_scale must be K-contiguous"
-    assert bs3.stride(-1) == 1, (
-        "B_scale must be K-contiguous on its K axis (pass .mT of an (N, K/32) row-major tensor)"
-    )
-    assert as3.shape == (l, m, sf_k), (
-        f"A_scale shape: expected (l={l},m={m},sf_k={sf_k}) K-contig, got {tuple(as3.shape)}"
-    )
-    assert bs3.shape == (l, n, sf_k), (
-        f"B_scale shape: expected .mT of (l={l},sf_k={sf_k},n={n}) -> ({l},{n},{sf_k}), got {tuple(bs3.shape)}"
-    )
+    if A_scale.dim() == 1:
+        sc_contig_A = _blocked_scale_1d_view(A_scale, m, sf_k, l)
+    else:
+        as3 = _as_3d(A_scale, A_scale.dim())
+        assert as3.stride(-1) == 1, "A_scale must be K-contiguous"
+        assert as3.shape == (l, m, sf_k), (
+            f"A_scale shape: expected (l={l},m={m},sf_k={sf_k}) K-contig, got {tuple(as3.shape)}"
+        )
+        sc_contig_A = pack_scale_2d_to_blocked_contig(as3.contiguous())
+
+    if B_scale.dim() == 1:
+        sc_contig_B = _blocked_scale_1d_view(B_scale, n, sf_k, l)
+    else:
+        bs3 = _as_3d(B_scale, B_scale.dim()).mT
+        assert bs3.stride(-1) == 1, (
+            "B_scale must be K-contiguous on its K axis (pass .mT of an (N, K/32) row-major tensor)"
+        )
+        assert bs3.shape == (l, n, sf_k), (
+            f"B_scale shape: expected .mT of (l={l},sf_k={sf_k},n={n}) -> ({l},{n},{sf_k}), got {tuple(bs3.shape)}"
+        )
+        sc_contig_B = pack_scale_2d_to_blocked_contig(bs3.contiguous())
+
     # Force row-major contiguous for packer/kernel consumption.
     # A3 / B3 are views — .contiguous() materializes (l,m,k) / (l,n,k) row-major.
     A3_c = A3.contiguous()
@@ -189,8 +208,6 @@ def _to_kernel_layout(
     # (l, m, k) -> (m, k, l) K-major view (no copy; strides (k, 1, m*k))
     mA_mkl = A3_c.permute(1, 2, 0)
     mB_nkl = B3_c.permute(1, 2, 0)
-    sc_contig_A = pack_scale_2d_to_blocked_contig(as3.contiguous())
-    sc_contig_B = pack_scale_2d_to_blocked_contig(bs3.contiguous())
     sfa_view = scale_view_for_kernel(sc_contig_A, m, sf_k, l)
     sfb_view = scale_view_for_kernel(sc_contig_B, n, sf_k, l)
     return m, n, k, l, mA_mkl, mB_nkl, sc_contig_A, sc_contig_B, sfa_view, sfb_view, was_2d
