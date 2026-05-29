@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from quack.autotuner import AutotuneConfig
@@ -5,13 +6,16 @@ from quack.gemm_config import GemmConfig
 from quack.gemm_interface import (
     _force_local_reduce_config,
     _is_safe_local_reduce_config,
+    gemm_act,
     gemm_act_tuned,
+    gemm_tuned,
     prune_invalid_gemm_configs,
 )
 
 
 def test_gemm_act_tuned_key_includes_epilogue_local_reduce_compile_knobs():
     required = {
+        "cu_seqlens_n",
         "tensor_epilogue_key",
         "tensor_epilogue_uses_c",
         "tensor_epilogue_returns_aux",
@@ -31,6 +35,33 @@ def test_gemm_act_tuned_key_includes_epilogue_local_reduce_compile_knobs():
     }
 
     assert required <= set(gemm_act_tuned.keys)
+    assert "cu_seqlens_n" in gemm_tuned.keys
+
+
+def test_gemm_act_rejects_local_reduce_out_feeding_main():
+    A = torch.empty((16, 16), dtype=torch.bfloat16)
+    B = torch.empty((16, 64), dtype=torch.bfloat16)
+    local_reduce_out = torch.empty((16, 2), dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="local_reduce_out"):
+        gemm_act(
+            A,
+            B,
+            local_reduce_out=local_reduce_out,
+            local_reduce_feeds_main=True,
+        )
+
+
+def test_gemm_act_varlen_n_without_tensor_epilogue_rejects(monkeypatch):
+    import quack.gemm_interface as gi
+
+    monkeypatch.setattr(gi, "ensure_varlen_n_supported", lambda device: None)
+    A = torch.empty((2, 16, 16), dtype=torch.bfloat16)
+    B = torch.empty((16, 64), dtype=torch.bfloat16)
+    cu_seqlens_n = torch.tensor([0, 32, 64], dtype=torch.int32)
+
+    with pytest.raises(NotImplementedError, match="tensor_epilogue_fn"):
+        gemm_act(A, B, cu_seqlens_n=cu_seqlens_n, activation="relu")
 
 
 def test_force_local_reduce_config_returns_safe_family():

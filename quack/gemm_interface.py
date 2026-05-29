@@ -13,7 +13,7 @@ from quack.gemm_config import GemmConfig, get_all_configs
 
 from quack._compile_payload import set_epilogue_source_cache_key
 from quack.autotuner import autotune, AutotuneConfig
-from quack.cute_dsl_utils import get_device_capacity
+from quack.cute_dsl_utils import ensure_varlen_n_supported, get_device_capacity
 from quack.gemm import gemm as gemm_dispatch
 from quack.gemm_act import gemm_act as gemm_act_dispatch
 from quack.gemm_dact import gemm_dact as gemm_dact_dispatch
@@ -50,7 +50,12 @@ def _empty_k_matmul_into(
 
 _LOCAL_REDUCE_OPS = {"sum", "amax_abs", "mx_e8m0_scale", "nvfp4_e4m3_scale", "copy"}
 _SCALE_LOCAL_REDUCE_OPS = {"mx_e8m0_scale", "nvfp4_e4m3_scale"}
-_GEMM_ACT_BASE_AUTOTUNE_KEYS = ["activation", "dynamic_scheduler", "concat_layout"]
+_GEMM_ACT_BASE_AUTOTUNE_KEYS = [
+    "activation",
+    "dynamic_scheduler",
+    "concat_layout",
+    "cu_seqlens_n",
+]
 _TENSOR_EPILOGUE_AUTOTUNE_KEYS = [
     "tensor_epilogue_key",
     "tensor_epilogue_uses_c",
@@ -177,6 +182,7 @@ def _select_varlen_n_config(
 
 
 def _varlen_n_config(A: Tensor, B: Tensor, cu_seqlens_n: Tensor | None) -> GemmConfig:
+    ensure_varlen_n_supported(A)
     return _select_varlen_n_config(
         A.device,
         A.shape[-2],
@@ -427,7 +433,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["dynamic_scheduler", "concat_layout"],
+    key=["dynamic_scheduler", "concat_layout", "cu_seqlens_n"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_tuned(
@@ -451,6 +457,8 @@ def gemm_tuned(
     sr_seed: int | Tensor = 0,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
+    if cu_seqlens_n is not None:
+        ensure_varlen_n_supported(A)
     if config is None:
         if cu_seqlens_n is not None:
             config = _varlen_n_config(A, B, cu_seqlens_n)
@@ -613,8 +621,16 @@ def gemm_act_tuned(
             if cu_seqlens_n is not None
             else default_config(A.device)
         )
+    if cu_seqlens_n is not None:
+        ensure_varlen_n_supported(A)
+        if tensor_epilogue_fn is None:
+            raise NotImplementedError("QUACK varlen_n activation epilogues require tensor_epilogue_fn")
     if tensor_epilogue_fn is not None and tensor_epilogue_source is not None:
         set_epilogue_source_cache_key(tensor_epilogue_fn, tensor_epilogue_source)
+    if local_reduce_out is not None and local_reduce_feeds_main:
+        raise NotImplementedError(
+            "local_reduce_out cannot be combined with local_reduce_feeds_main"
+        )
     if local_reduce_out is not None or local_reduce_feeds_main:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = 32 if local_reduce_group is None else local_reduce_group
@@ -1406,7 +1422,14 @@ def gemm_act(
     varlen_k = cu_seqlens_k is not None
     varlen_n = cu_seqlens_n is not None
     assert sum((varlen_m, varlen_k, varlen_n)) <= 1, "Only one of cu_seqlens_m, cu_seqlens_k, and cu_seqlens_n"
+    if local_reduce_out is not None and local_reduce_feeds_main:
+        raise NotImplementedError(
+            "local_reduce_out cannot be combined with local_reduce_feeds_main"
+        )
     if varlen_n:
+        ensure_varlen_n_supported(A)
+        if tensor_epilogue_fn is None:
+            raise NotImplementedError("QUACK varlen_n activation epilogues require tensor_epilogue_fn")
         if any(x is not None for x in (C, bias, colvec_bias, local_reduce_out)):
             raise NotImplementedError("QUACK varlen_n does not support C/bias/local reductions yet")
         if A_idx is not None or beta != 1.0 or tensor_epilogue_returns_aux:

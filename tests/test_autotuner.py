@@ -24,6 +24,20 @@ def test_autotune_config_supports_multi_kwarg_hash_and_equality():
     assert len({config_a, config_b, config_c}) == 2
 
 
+def test_autotune_key_serializes_int_tensor_values():
+    import torch
+
+    @autotune(configs=[AutotuneConfig(config="a")], key=["offs"], cache_results=False)
+    def tuned(offs, config=None):
+        pass
+
+    key_a = tuned._make_cache_key({"offs": torch.arange(257, dtype=torch.int32)})
+    key_b = tuned._make_cache_key({"offs": torch.arange(257, dtype=torch.int32) * 2})
+
+    assert key_a != key_b
+    assert "int32" in key_a[0]
+
+
 def test_autotune_key_serializes_nested_tensor_metadata():
     import torch
 

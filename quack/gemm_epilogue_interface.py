@@ -206,6 +206,10 @@ def gemm_epilogue(
         tuned = os.getenv("QUACK_GEMM_EPILOGUE_TUNED", "0") == "1"
     if epilogue_source is not None:
         set_epilogue_source_cache_key(epilogue_fn, epilogue_source)
+    if local_reduce_out is not None and local_reduce_feeds_main:
+        raise NotImplementedError(
+            "local_reduce_out cannot be combined with local_reduce_feeds_main"
+        )
     if local_reduce_out is not None:
         _validate_local_reduce_op_and_dtype(local_reduce_op, local_reduce_out)
         local_reduce_group = _validate_local_reduce(

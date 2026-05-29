@@ -11,7 +11,12 @@ from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
+from quack.cute_dsl_utils import (
+    ensure_varlen_n_supported,
+    get_device_capacity,
+    get_max_active_clusters,
+    torch2cute_dtype_map,
+)
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
     GemmDefaultSm80,
@@ -198,6 +203,7 @@ def gemm(
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
     if varlen_n:
+        ensure_varlen_n_supported(A)
         assert not gather_A, "gather_A is not supported with varlen_n"
         assert batch_idx_permute is None, "batch_idx_permute is not supported with varlen_n"
         assert C is None and beta == 1.0 and not add_to_output, "C/beta/add_to_output are not supported with varlen_n"

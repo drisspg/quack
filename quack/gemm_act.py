@@ -14,6 +14,7 @@ from cutlass.cute.nvgpu import warp
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
+    ensure_varlen_n_supported,
     mlir_namedtuple,
     get_device_capacity,
     get_max_active_clusters,
@@ -929,6 +930,7 @@ def gemm_act(
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
     if varlen_n:
+        ensure_varlen_n_supported(A)
         assert persistent, "varlen_n requires persistent=True"
         assert A.stride(-1) == 1, "varlen_n requires public A to be k-major"
         assert B.stride(-2) == 1, "varlen_n requires B to be n-major after transpose"

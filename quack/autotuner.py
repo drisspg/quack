@@ -344,11 +344,16 @@ class Autotuner:
     @staticmethod
     def _key_arg(value):
         if isinstance(value, Tensor):
+            value_key = None
+            if value.ndim == 1 and not value.dtype.is_floating_point:
+                value_bytes = value.detach().cpu().contiguous().numpy().tobytes()
+                value_key = hashlib.sha256(value_bytes).hexdigest()
             return (
                 "Tensor",
                 tuple(value.shape),
                 tuple(s if s in {0, 1} else 2 for s in value.stride()),
                 str(value.dtype),
+                value_key,
             )
         if isinstance(value, tuple):
             return tuple(Autotuner._key_arg(v) for v in value)
@@ -558,7 +563,7 @@ class Autotuner:
         if use_l2_cold:
             try:
                 bench_mode = os.getenv(
-                    f"{PACKAGE_NAME.upper()}_AUTOTUNE_BENCH_MODE", "torch_cudagraph"
+                    f"{PACKAGE_NAME.upper()}_AUTOTUNE_BENCH_MODE", "l2_rotate"
                 )
                 if bench_mode in ("torch_profile", "torch_cudagraph"):
                     num_iters = int(
