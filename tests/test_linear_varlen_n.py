@@ -8,7 +8,7 @@ import torch
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.gemm_epilogue_interface import gemm_epilogue
-from quack.gemm_interface import gemm_ref, gemm_tuned
+from quack.gemm_interface import gemm, gemm_ref, gemm_tuned
 
 sm100_only = pytest.mark.skipif(
     not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] not in (10, 11),
@@ -50,7 +50,7 @@ def _run_varlen_n(A, B, cu_seqlens_n, *, tile_n=128):
 
 
 def _assert_matches_native_grouped_mm(A, B, cu_seqlens_n):
-    out = _run_varlen_n(A, B, cu_seqlens_n)
+    out = gemm(A, B, cu_seqlens_n=cu_seqlens_n, tuned=True)
     ref = torch._grouped_mm(A, B, cu_seqlens_n[1:])
     covered_n = int(cu_seqlens_n[-1].item())
     torch.testing.assert_close(out[:, :covered_n], ref[:, :covered_n], atol=0.5, rtol=0.05)

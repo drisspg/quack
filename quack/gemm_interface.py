@@ -935,7 +935,10 @@ def gemm_out(
     concat_layout: Optional[str] = None,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
-    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    if cu_seqlens_n is not None:
+        fn = partial(gemm_tuned.fn, config=_varlen_n_config(A, B, cu_seqlens_n))
+    else:
+        fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     # Shared helpers: drift between this eager body and the register_fake side
     # is structurally impossible because both call the same functions.
     alpha = _merge_tensor(alpha, alpha_tensor)
@@ -1489,7 +1492,10 @@ def gemm_act(
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
     if tensor_epilogue_fn is not None:
-        fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
+        if cu_seqlens_n is not None:
+            fn = partial(gemm_act_tuned.fn, config=_varlen_n_config(A, B, cu_seqlens_n))
+        else:
+            fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
         fn(
             A,
             B,
