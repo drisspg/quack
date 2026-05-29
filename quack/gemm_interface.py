@@ -99,6 +99,40 @@ def _is_safe_local_reduce_config(config: GemmConfig) -> bool:
     )
 
 
+def _varlen_n_offsets(cu_seqlens_n: Tensor | None) -> list[int]:
+    if cu_seqlens_n is None:
+        return []
+    return [int(offset) for offset in cu_seqlens_n.detach().cpu().tolist()]
+
+
+def _validate_varlen_n_tile_alignment(cu_seqlens_n: Tensor | None, tile_n: int) -> None:
+    if any(offset % tile_n != 0 for offset in _varlen_n_offsets(cu_seqlens_n)):
+        raise NotImplementedError(
+            "QUACK varlen-N currently requires cumulative N offsets to be tile_n-aligned; "
+            "non-aligned partial N tiles must fall back to torch._grouped_mm"
+        )
+
+
+def _select_varlen_n_tile_n(cu_seqlens_n: Tensor | None) -> int:
+    offsets = _varlen_n_offsets(cu_seqlens_n)
+    for tile_n in (64, 32, 16, 8):
+        if all(offset % tile_n == 0 for offset in offsets):
+            return tile_n
+    return 8
+
+
+def _varlen_n_config(device: torch.device | str, cu_seqlens_n: Tensor | None) -> GemmConfig:
+    return GemmConfig(
+        tile_m=128,
+        tile_n=_select_varlen_n_tile_n(cu_seqlens_n),
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+        device_capacity=get_device_capacity(device)[0],
+    )
+
+
 def _local_reduce_tile_n(config: GemmConfig, group: int) -> int:
     if _is_safe_local_reduce_config(config) and config.tile_n % group == 0:
         return config.tile_n
@@ -346,6 +380,7 @@ def gemm_tuned(
     beta: float | Tensor = 1.0,  # (1,)
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
+    cu_seqlens_n: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     add_to_output: bool = False,
@@ -356,10 +391,12 @@ def gemm_tuned(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
     if config is None:
-        # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
-        is_pure_gemm = (
+        if cu_seqlens_n is not None:
+            config = _varlen_n_config(A.device, cu_seqlens_n)
+        is_pure_gemm = config is None and (
             cu_seqlens_m is None
             and cu_seqlens_k is None
+            and cu_seqlens_n is None
             and A_idx is None
             and C is None
             and bias is None
@@ -372,29 +409,33 @@ def gemm_tuned(
             config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
-    varlen = varlen_m or varlen_k
+    varlen_n = cu_seqlens_n is not None
+    varlen = varlen_m or varlen_k or varlen_n
     gather_A = A_idx is not None
     if gather_A:
         assert varlen, "gather_A requires either varlen_m or varlen_k"
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
-    if varlen_m:
-        assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if varlen_m or varlen_n:
+        assert not config.swap_ab, "Variable-length output dimensions are not supported with swap_ab"
+    _validate_varlen_n_tile_alignment(cu_seqlens_n, config.tile_n)
     if A.ndim == 2 and not varlen:
         A = A.unsqueeze(0)  # (1, M, K)
     B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
-    if B.ndim == 2 and not varlen_k:
+    if B.ndim == 2 and not varlen_k and not varlen_n:
         B = B.unsqueeze(0)  # (1, N, K)
-    if C is not None and C.ndim == 2 and not varlen_m:
+    if C is not None and C.ndim == 2 and not varlen_m and not varlen_n:
         C = C.unsqueeze(0)  # (1, M, N)
-    if out.ndim == 2 and not varlen_m:
+    if out.ndim == 2 and not varlen_m and not varlen_n:
         out = out.unsqueeze(0)
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
+    batch_size = B.shape[0] if not varlen_k and not varlen_n else (cu_seqlens_k.shape[0] - 1 if varlen_k else cu_seqlens_n.shape[0] - 1)
     if varlen_m:
         # If gather_A (A_idx provided), use its length; otherwise use A.shape[0]
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
         out_shape = (total_m, B.shape[-2])
+    elif varlen_n:
+        out_shape = (A.shape[-2], B.shape[-2])
     else:
         out_shape = (batch_size, A.shape[-2], B.shape[-2])
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
@@ -443,6 +484,7 @@ def gemm_tuned(
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_n=cu_seqlens_n,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
@@ -477,6 +519,7 @@ def gemm_act_tuned(
     activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
+    cu_seqlens_n: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
@@ -504,7 +547,11 @@ def gemm_act_tuned(
     main_output_transform_group: int | None = None,
 ) -> None:
     if config is None:
-        config = default_config(A.device)
+        config = (
+            _varlen_n_config(A.device, cu_seqlens_n)
+            if cu_seqlens_n is not None
+            else default_config(A.device)
+        )
     if tensor_epilogue_fn is not None and tensor_epilogue_source is not None:
         set_epilogue_source_cache_key(tensor_epilogue_fn, tensor_epilogue_source)
     if local_reduce_out is not None or local_reduce_feeds_main:
@@ -523,21 +570,23 @@ def gemm_act_tuned(
     concat_layout = _parse_concat_layout(concat_layout)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
-    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
-    if varlen_m:
-        assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not (varlen_m or varlen_k):
+    varlen_n = cu_seqlens_n is not None
+    assert sum((varlen_m, varlen_k, varlen_n)) <= 1, "Only one of cu_seqlens_m, cu_seqlens_k, and cu_seqlens_n"
+    if varlen_m or varlen_n:
+        assert not config.swap_ab, "Variable-length output dimensions are not supported with swap_ab"
+    _validate_varlen_n_tile_alignment(cu_seqlens_n, config.tile_n)
+    if A.ndim == 2 and not (varlen_m or varlen_k or varlen_n):
         A = A.unsqueeze(0)  # (1, M, K)
     B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
-    if B.ndim == 2 and not varlen_k:
+    if B.ndim == 2 and not varlen_k and not varlen_n:
         B = B.unsqueeze(0)  # (1, N, K)
-    if C is not None and C.ndim == 2 and not varlen_m:
+    if C is not None and C.ndim == 2 and not varlen_m and not varlen_n:
         C = C.unsqueeze(0)  # (1, M, N)
-    if preact_out is not None and preact_out.ndim == 2 and not varlen_m:
+    if preact_out is not None and preact_out.ndim == 2 and not varlen_m and not varlen_n:
         D = preact_out.unsqueeze(0)
     else:
         D = preact_out
-    if postact_out.ndim == 2 and not varlen_m:
+    if postact_out.ndim == 2 and not varlen_m and not varlen_n:
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
@@ -600,6 +649,7 @@ def gemm_act_tuned(
         colvec_bias=colvec_bias if not config.swap_ab else bias,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_n=cu_seqlens_n,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
         concat_layout=concat_layout,
@@ -714,6 +764,7 @@ def gemm(
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
+    cu_seqlens_n: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
@@ -727,6 +778,7 @@ def gemm(
         out_dtype = A.dtype if out_dtype is None else out_dtype
         varlen_m = cu_seqlens_m is not None
         varlen_k = cu_seqlens_k is not None
+        varlen_n = cu_seqlens_n is not None
         if varlen_m:
             total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
             out_shape = (total_m, B.shape[-1])
@@ -734,6 +786,8 @@ def gemm(
             L = cu_seqlens_k.shape[0] - 1
             # For varlen_k, the first dimension is always A.shape[0] (M dimension)
             out_shape = (L, A.shape[0], B.shape[-1])
+        elif varlen_n:
+            out_shape = (A.shape[-2], B.shape[-1])
         else:
             out_shape = (
                 (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
@@ -762,6 +816,7 @@ def gemm(
         alpha_tensor=alpha_tensor,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_n=cu_seqlens_n,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
@@ -792,6 +847,7 @@ def gemm_out(
     alpha_tensor: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
+    cu_seqlens_n: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
@@ -816,6 +872,7 @@ def gemm_out(
         alpha=alpha,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_n=cu_seqlens_n,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
@@ -834,6 +891,7 @@ def gemm_ref(
     alpha: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
+    cu_seqlens_n: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     out_dtype: Optional[torch.dtype] = None,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
@@ -848,7 +906,7 @@ def gemm_ref(
             B = _concat_interleave(B)
         if "bias" in concat_layout and bias is not None:
             bias = _concat_interleave_bias(bias)
-    if cu_seqlens_m is None and cu_seqlens_k is None:
+    if cu_seqlens_m is None and cu_seqlens_k is None and cu_seqlens_n is None:
         fn = torch.bmm if A.ndim == 3 else torch.mm
         out = fn(A, B, out_dtype=out_dtype, out=out)
         if not isinstance(alpha, float) or alpha != 1.0:
@@ -873,7 +931,7 @@ def gemm_ref(
                 out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]] *= alpha
             if bias is not None:
                 out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]] += bias[i]
-    else:  # cu_seqlens_k is not None
+    elif cu_seqlens_k is not None:
         L = cu_seqlens_k.shape[0] - 1
         if out is None:
             out = torch.empty((L, A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
@@ -888,6 +946,17 @@ def gemm_ref(
             out *= alpha
         if bias is not None:
             out += bias
+    else:
+        L = cu_seqlens_n.shape[0] - 1
+        if out is None:
+            out = torch.empty((A.shape[-2], B.shape[1]), dtype=out_dtype, device=A.device)
+        for i in range(L):
+            n0, n1 = cu_seqlens_n[i], cu_seqlens_n[i + 1]
+            torch.mm(A[i], B[:, n0:n1], out=out[:, n0:n1])
+        if not isinstance(alpha, float) or alpha != 1.0:
+            out[:, : cu_seqlens_n[-1]] *= alpha
+        if bias is not None:
+            out[:, : cu_seqlens_n[-1]] += bias[: cu_seqlens_n[-1]]
     if concat_layout and "out" in concat_layout:
         # out is n-major (ref allocates contiguous). Split rows (non-contiguous dim).
         out = torch.cat([out[..., ::2, :], out[..., 1::2, :]], dim=-2)
@@ -1230,6 +1299,7 @@ def gemm_act(
     postact_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
+    cu_seqlens_n: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) if gather_A with varlen
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
@@ -1273,13 +1343,25 @@ def gemm_act(
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
-    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
+    varlen_n = cu_seqlens_n is not None
+    assert sum((varlen_m, varlen_k, varlen_n)) <= 1, "Only one of cu_seqlens_m, cu_seqlens_k, and cu_seqlens_n"
+    if varlen_n:
+        if any(x is not None for x in (C, bias, colvec_bias, local_reduce_out)):
+            raise NotImplementedError("QUACK varlen_n does not support C/bias/local reductions yet")
+        if A_idx is not None or beta != 1.0 or tensor_epilogue_returns_aux:
+            raise NotImplementedError("QUACK varlen_n supports only accumulator pointwise epilogues")
+        if tensor_epilogue_rowvec_biases or tensor_epilogue_colvec_biases or tensor_epilogue_tile_biases:
+            raise NotImplementedError("QUACK varlen_n does not support tensor epilogue args yet")
+        if main_output_transform is not None or main_output_transform_group is not None:
+            raise NotImplementedError("QUACK varlen_n does not support shape-changing epilogues yet")
     # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
         out_shape = (total_m, B.shape[-1])
     elif varlen_k:
         out_shape = (cu_seqlens_k.shape[0] - 1, A.shape[0], B.shape[-1])
+    elif varlen_n:
+        out_shape = (A.shape[-2], B.shape[-1])
     elif A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
     else:
@@ -1334,6 +1416,7 @@ def gemm_act(
             activation,
             cu_seqlens_m,
             cu_seqlens_k,
+            cu_seqlens_n,
             A_idx,
             dynamic_scheduler,
             tensor_epilogue_fn=tensor_epilogue_fn,
@@ -1428,10 +1511,10 @@ def gemm_act_out(
         C,
         bias,
         activation,
-        cu_seqlens_m,
-        cu_seqlens_k,
-        A_idx,
-        dynamic_scheduler,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
     )
 
 

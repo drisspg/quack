@@ -1,12 +1,81 @@
 from collections.abc import Callable
 import os
+import weakref
 
 import torch
 from torch import Tensor
 
 from quack._compile_payload import set_epilogue_source_cache_key
 from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
+from quack.gemm_act import gemm_act as gemm_act_dispatch
 from quack.gemm_interface import _validate_local_reduce_op_and_dtype, gemm_act
+
+
+_VARLEN_N_TILE_CACHE: dict[int, tuple[weakref.ReferenceType[Tensor], int, int, int]] = {}
+
+
+def _cached_varlen_n_tile_n(offs: Tensor) -> tuple[int, int]:
+    cached = _VARLEN_N_TILE_CACHE.get(id(offs))
+    version = offs._version
+    if cached is not None:
+        cached_ref, cached_version, cached_tile_n, cached_covered_n = cached
+        if cached_ref() is offs and cached_version == version:
+            return cached_tile_n, cached_covered_n
+
+    offsets = [int(offset) for offset in offs.detach().cpu().tolist()]
+    covered_n = offsets[-1]
+    for tile_n in (64, 32, 16, 8):
+        if all(offset % tile_n == 0 for offset in offsets):
+            _VARLEN_N_TILE_CACHE[id(offs)] = (weakref.ref(offs), version, tile_n, covered_n)
+            return tile_n, covered_n
+    raise NotImplementedError(
+        "QUACK varlen-N currently requires cumulative N offsets to be tile_n-aligned; "
+        "non-aligned partial N tiles must fall back to torch._grouped_mm"
+    )
+
+
+def _cu_seqlens_from_offsets(offs: Tensor) -> Tensor:
+    return torch.cat((offs.new_zeros(1), offs))
+
+
+def _grouped_mm_3d_2d_epilogue(
+    a: Tensor,
+    b: Tensor,
+    offs: Tensor,
+    epilogue_fn: Callable,
+    epilogue_key: str,
+    out_dtype,
+) -> Tensor:
+    tile_n, covered_n = _cached_varlen_n_tile_n(offs)
+    if covered_n > b.shape[-1]:
+        raise RuntimeError(
+            f"grouped GEMM offsets must not exceed B's N dimension, got {covered_n} > {b.shape[-1]}"
+        )
+    out = torch.empty(
+        (a.shape[-2], b.shape[-1]),
+        device=a.device,
+        dtype=a.dtype if out_dtype is None else out_dtype,
+    )
+    gemm_act_dispatch(
+        a,
+        b.mT,
+        None,
+        None,
+        out,
+        None,
+        None,
+        128,
+        tile_n,
+        1,
+        1,
+        pingpong=False,
+        persistent=True,
+        is_dynamic_persistent=False,
+        cu_seqlens_n=_cu_seqlens_from_offsets(offs),
+        tensor_epilogue_fn=epilogue_fn,
+        tensor_epilogue_key=epilogue_key,
+    )
+    return out
 
 
 def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
@@ -151,17 +220,30 @@ def gemm_epilogue(
             raise NotImplementedError("QUACK grouped GEMM epilogue does not support C/scales/alpha/beta yet")
         if offs.dtype is not torch.int32:
             raise RuntimeError(f"grouped GEMM offsets must be int32, got {offs.dtype}")
-        cu_seqlens = torch.empty(offs.shape[0] + 1, device=offs.device, dtype=offs.dtype)
-        cu_seqlens[0] = 0
-        cu_seqlens[1:] = offs
+        if a.dim() == 3 and b.dim() == 2:
+            if main_output_transform is not None or main_output_transform_group is not None:
+                raise NotImplementedError("QUACK varlen_n does not support shape-changing epilogues yet")
+            if concat_layout:
+                raise NotImplementedError("QUACK varlen_n does not support concat_layout epilogues yet")
+            return _grouped_mm_3d_2d_epilogue(
+                a,
+                b,
+                offs,
+                epilogue_fn,
+                epilogue_key,
+                out_dtype,
+            )
+        cu_seqlens = _cu_seqlens_from_offsets(offs)
         if a.dim() == 2 and b.dim() == 3:
             cu_seqlens_m = cu_seqlens
             cu_seqlens_k = None
+            cu_seqlens_n = None
         elif a.dim() == 2 and b.dim() == 2:
             cu_seqlens_m = None
             cu_seqlens_k = cu_seqlens
+            cu_seqlens_n = None
         else:
-            raise NotImplementedError("QUACK grouped GEMM epilogue supports only 2D/3D and 2D/2D grouped_mm")
+            raise NotImplementedError("QUACK grouped GEMM epilogue supports only 2D/3D, 2D/2D, and 3D/2D grouped_mm")
         _, out = gemm_act(
             a,
             b,
@@ -173,6 +255,7 @@ def gemm_epilogue(
             tensor_epilogue_source=epilogue_source,
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_n=cu_seqlens_n,
             out_dtype=out_dtype,
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
             main_output_transform=main_output_transform,
