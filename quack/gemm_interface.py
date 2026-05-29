@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao
 import os
+import weakref
 from dataclasses import replace
 from functools import partial
 from typing import Callable, Literal, Optional, Tuple
@@ -99,10 +100,25 @@ def _is_safe_local_reduce_config(config: GemmConfig) -> bool:
     )
 
 
+_VARLEN_N_OFFSETS_CACHE: dict[int, tuple[weakref.ReferenceType[Tensor], int, list[int]]] = {}
+
+
 def _varlen_n_offsets(cu_seqlens_n: Tensor | None) -> list[int]:
     if cu_seqlens_n is None:
         return []
-    return [int(offset) for offset in cu_seqlens_n.detach().cpu().tolist()]
+    cached = _VARLEN_N_OFFSETS_CACHE.get(id(cu_seqlens_n))
+    version = cu_seqlens_n._version
+    if cached is not None:
+        cached_ref, cached_version, cached_offsets = cached
+        if cached_ref() is cu_seqlens_n and cached_version == version:
+            return cached_offsets
+    offsets = [int(offset) for offset in cu_seqlens_n.detach().cpu().tolist()]
+    _VARLEN_N_OFFSETS_CACHE[id(cu_seqlens_n)] = (
+        weakref.ref(cu_seqlens_n),
+        version,
+        offsets,
+    )
+    return offsets
 
 
 def _validate_varlen_n_tile_alignment(cu_seqlens_n: Tensor | None, tile_n: int) -> None:
@@ -113,23 +129,59 @@ def _validate_varlen_n_tile_alignment(cu_seqlens_n: Tensor | None, tile_n: int) 
         )
 
 
-def _select_varlen_n_tile_n(cu_seqlens_n: Tensor | None) -> int:
-    offsets = _varlen_n_offsets(cu_seqlens_n)
-    for tile_n in (64, 32, 16, 8):
+def _max_varlen_n_tile_n(offsets: list[int]) -> int:
+    for tile_n in (256, 128, 64, 32, 16, 8):
         if all(offset % tile_n == 0 for offset in offsets):
             return tile_n
     return 8
 
 
-def _varlen_n_config(device: torch.device | str, cu_seqlens_n: Tensor | None) -> GemmConfig:
+def _select_varlen_n_config(
+    device: torch.device | str,
+    m: int,
+    k: int,
+    offsets: list[int],
+) -> GemmConfig:
+    max_tile_n = _max_varlen_n_tile_n(offsets)
+    num_groups = max(len(offsets) - 1, 1)
+    max_group_n = max(
+        (end - start for start, end in zip(offsets, offsets[1:])), default=0
+    )
+    tile_m = 128
+    tile_n = max_tile_n
+    cluster_m = 1
+
+    if max_tile_n >= 256 and (
+        m >= 2048 or (num_groups >= 8 and max_group_n >= 512 and k <= 2048)
+    ):
+        tile_m = 256
+        tile_n = 256
+        cluster_m = 2
+    elif max_tile_n >= 128:
+        tile_n = 64 if m <= 512 else 128
+        if k >= 4096 and m >= 1024:
+            tile_m = 256
+            cluster_m = 2
+    elif max_tile_n >= 64:
+        tile_n = 64
+
     return GemmConfig(
-        tile_m=128,
-        tile_n=_select_varlen_n_tile_n(cu_seqlens_n),
-        cluster_m=1,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster_m,
         cluster_n=1,
         pingpong=False,
-        is_dynamic_persistent=False,
+        is_dynamic_persistent=cluster_m > 1,
         device_capacity=get_device_capacity(device)[0],
+    )
+
+
+def _varlen_n_config(A: Tensor, B: Tensor, cu_seqlens_n: Tensor | None) -> GemmConfig:
+    return _select_varlen_n_config(
+        A.device,
+        A.shape[-2],
+        A.shape[-1],
+        _varlen_n_offsets(cu_seqlens_n),
     )
 
 
@@ -318,11 +370,20 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
+    varlen_n = kwargs.get("cu_seqlens_n", None) is not None
     local_reduce_active = kwargs.get("local_reduce_out", None) is not None or kwargs.get(
         "local_reduce_feeds_main", False
     )
-    if varlen_m or gather_A or local_reduce_active:  # Doesn't support swap_ab
+    if varlen_m or varlen_n or gather_A or local_reduce_active:
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    if varlen_n:
+        offsets = _varlen_n_offsets(kwargs["cu_seqlens_n"])
+        configs = [
+            conf
+            for conf in configs
+            if conf.kwargs["config"].cluster_n == 1
+            and all(offset % conf.kwargs["config"].tile_n == 0 for offset in offsets)
+        ]
     if local_reduce_active:
         local_reduce_group = kwargs.get("local_reduce_group", None) or 32
         local_reduce_dim = kwargs.get("local_reduce_dim", None)
@@ -392,7 +453,7 @@ def gemm_tuned(
 ) -> None:
     if config is None:
         if cu_seqlens_n is not None:
-            config = _varlen_n_config(A.device, cu_seqlens_n)
+            config = _varlen_n_config(A, B, cu_seqlens_n)
         is_pure_gemm = config is None and (
             cu_seqlens_m is None
             and cu_seqlens_k is None
@@ -548,7 +609,7 @@ def gemm_act_tuned(
 ) -> None:
     if config is None:
         config = (
-            _varlen_n_config(A.device, cu_seqlens_n)
+            _varlen_n_config(A, B, cu_seqlens_n)
             if cu_seqlens_n is not None
             else default_config(A.device)
         )

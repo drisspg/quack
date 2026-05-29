@@ -8,30 +8,42 @@ from torch import Tensor
 from quack._compile_payload import set_epilogue_source_cache_key
 from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
 from quack.gemm_act import gemm_act as gemm_act_dispatch
-from quack.gemm_interface import _validate_local_reduce_op_and_dtype, gemm_act
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import (
+    _select_varlen_n_config,
+    _validate_local_reduce_op_and_dtype,
+    gemm_act,
+)
 
 
-_VARLEN_N_TILE_CACHE: dict[int, tuple[weakref.ReferenceType[Tensor], int, int, int]] = {}
+_VARLEN_N_CONFIG_CACHE: dict[
+    int, tuple[weakref.ReferenceType[Tensor], int, tuple[int, int, int, int], GemmConfig, int]
+] = {}
 
 
-def _cached_varlen_n_tile_n(offs: Tensor) -> tuple[int, int]:
-    cached = _VARLEN_N_TILE_CACHE.get(id(offs))
+def _cached_varlen_n_config(a: Tensor, b: Tensor, offs: Tensor) -> tuple[GemmConfig, int]:
+    shape_key = (a.shape[-2], a.shape[-1], b.shape[-1], b.device.index or 0)
+    cached = _VARLEN_N_CONFIG_CACHE.get(id(offs))
     version = offs._version
     if cached is not None:
-        cached_ref, cached_version, cached_tile_n, cached_covered_n = cached
-        if cached_ref() is offs and cached_version == version:
-            return cached_tile_n, cached_covered_n
+        cached_ref, cached_version, cached_shape_key, cached_config, cached_covered_n = cached
+        if (
+            cached_ref() is offs
+            and cached_version == version
+            and cached_shape_key == shape_key
+        ):
+            return cached_config, cached_covered_n
 
-    offsets = [int(offset) for offset in offs.detach().cpu().tolist()]
+    offsets = [0, *(int(offset) for offset in offs.detach().cpu().tolist())]
     covered_n = offsets[-1]
-    for tile_n in (64, 32, 16, 8):
-        if all(offset % tile_n == 0 for offset in offsets):
-            _VARLEN_N_TILE_CACHE[id(offs)] = (weakref.ref(offs), version, tile_n, covered_n)
-            return tile_n, covered_n
-    raise NotImplementedError(
-        "QUACK varlen-N currently requires cumulative N offsets to be tile_n-aligned; "
-        "non-aligned partial N tiles must fall back to torch._grouped_mm"
-    )
+    config = _select_varlen_n_config(a.device, a.shape[-2], a.shape[-1], offsets)
+    if any(offset % config.tile_n != 0 for offset in offsets):
+        raise NotImplementedError(
+            "QUACK varlen-N currently requires cumulative N offsets to be tile_n-aligned; "
+            "non-aligned partial N tiles must fall back to torch._grouped_mm"
+        )
+    _VARLEN_N_CONFIG_CACHE[id(offs)] = (weakref.ref(offs), version, shape_key, config, covered_n)
+    return config, covered_n
 
 
 def _cu_seqlens_from_offsets(offs: Tensor) -> Tensor:
@@ -45,16 +57,35 @@ def _grouped_mm_3d_2d_epilogue(
     epilogue_fn: Callable,
     epilogue_key: str,
     out_dtype,
+    tuned: bool,
+    epilogue_source: str | None,
 ) -> Tensor:
-    tile_n, covered_n = _cached_varlen_n_tile_n(offs)
+    config, covered_n = _cached_varlen_n_config(a, b, offs)
     if covered_n > b.shape[-1]:
         raise RuntimeError(
             f"grouped GEMM offsets must not exceed B's N dimension, got {covered_n} > {b.shape[-1]}"
         )
+    postact_dtype = a.dtype if out_dtype is None else out_dtype
+    cu_seqlens_n = _cu_seqlens_from_offsets(offs)
+    if tuned:
+        _, out = gemm_act(
+            a,
+            b,
+            activation=None,
+            store_preact=False,
+            tuned=True,
+            tensor_epilogue_fn=epilogue_fn,
+            tensor_epilogue_key=epilogue_key,
+            tensor_epilogue_source=epilogue_source,
+            cu_seqlens_n=cu_seqlens_n,
+            out_dtype=out_dtype,
+            postact_dtype=postact_dtype,
+        )
+        return out
     out = torch.empty(
         (a.shape[-2], b.shape[-1]),
         device=a.device,
-        dtype=a.dtype if out_dtype is None else out_dtype,
+        dtype=postact_dtype,
     )
     gemm_act_dispatch(
         a,
@@ -64,14 +95,14 @@ def _grouped_mm_3d_2d_epilogue(
         out,
         None,
         None,
-        128,
-        tile_n,
-        1,
-        1,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
         pingpong=False,
         persistent=True,
-        is_dynamic_persistent=False,
-        cu_seqlens_n=_cu_seqlens_from_offsets(offs),
+        is_dynamic_persistent=config.is_dynamic_persistent,
+        cu_seqlens_n=cu_seqlens_n,
         tensor_epilogue_fn=epilogue_fn,
         tensor_epilogue_key=epilogue_key,
     )
@@ -232,6 +263,8 @@ def gemm_epilogue(
                 epilogue_fn,
                 epilogue_key,
                 out_dtype,
+                tuned,
+                epilogue_source,
             )
         cu_seqlens = _cu_seqlens_from_offsets(offs)
         if a.dim() == 2 and b.dim() == 3:
