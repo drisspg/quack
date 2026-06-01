@@ -5,6 +5,7 @@ import cutlass
 import cutlass.cute as cute
 
 from quack.blockscaled_gemm_utils import (
+    _fp4_unpacked_to_value,
     blockscaled_gemm_reference,
     compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
@@ -26,6 +27,15 @@ def _identity_epilogue(x):
 def _affine_aux_epilogue(acc, col_bias, row_scale, tile_bias):
     out = (acc + col_bias) * row_scale + tile_bias
     return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
+
+
+def _dequant_nvfp4(q_packed, scale, logical_k):
+    codes_lo = (q_packed & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
+    codes_hi = ((q_packed >> 4) & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
+    q_values = torch.stack(
+        [_fp4_unpacked_to_value(codes_lo), _fp4_unpacked_to_value(codes_hi)], dim=-1
+    ).reshape(*q_packed.shape[:-1], logical_k)
+    return q_values * scale.float().repeat_interleave(16, dim=-1)
 
 
 def _skip_if_not_sm100():
@@ -679,6 +689,35 @@ def test_nvfp4_scaled_mm_epilogue_reuses_interface_scale_layout():
     torch.testing.assert_close(
         out, torch.eye(M, N, device="cuda", dtype=torch.bfloat16), atol=0, rtol=0
     )
+
+
+def test_nvfp4_scaled_mm_epilogue_matches_dequant_reference_with_real_scales():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
+    from quack.mx_utils import to_nvfp4_compiled
+
+    M, N, K = 128, 192, 256
+    torch.manual_seed(2)
+    A_hp = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.25).contiguous()
+    W_hp = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.25).contiguous()
+    A_packed, A_sc, _ = to_nvfp4_compiled(A_hp, 16, None)
+    W_packed, W_sc, _ = to_nvfp4_compiled(W_hp, 16, None)
+    A_q = A_packed.view(torch.float4_e2m1fn_x2)
+    W_q = W_packed.view(torch.float4_e2m1fn_x2)
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        W_q.mT,
+        A_sc,
+        W_sc.mT,
+        _identity_epilogue,
+        "nvfp4_real_scales_identity",
+        out_dtype=torch.float32,
+    )
+
+    A_ref = _dequant_nvfp4(A_packed, A_sc, K)
+    W_ref = _dequant_nvfp4(W_packed, W_sc, K)
+    torch.testing.assert_close(out, A_ref @ W_ref.T, atol=2e-1, rtol=5e-2)
 
 
 def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
