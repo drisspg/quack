@@ -720,6 +720,46 @@ def test_nvfp4_scaled_mm_epilogue_matches_dequant_reference_with_real_scales():
     torch.testing.assert_close(out, A_ref @ W_ref.T, atol=2e-1, rtol=5e-2)
 
 
+def test_nvfp4_scaled_mm_epilogue_global_scales_compose_with_aux_tensors():
+    _skip_if_not_sm100()
+    from quack.gemm_epilogue_interface import gemm_epilogue
+    from quack.mx_utils import to_nvfp4_compiled
+
+    M, N, K = 128, 192, 256
+    torch.manual_seed(3)
+    A_hp = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.25).contiguous()
+    W_hp = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.25).contiguous()
+    A_packed, A_sc, _ = to_nvfp4_compiled(A_hp, 16, None)
+    W_packed, W_sc, _ = to_nvfp4_compiled(W_hp, 16, None)
+    A_q = A_packed.view(torch.float4_e2m1fn_x2)
+    W_q = W_packed.view(torch.float4_e2m1fn_x2)
+    scale_a_global = torch.tensor([1.25], device="cuda", dtype=torch.float32)
+    scale_b_global = torch.tensor([0.75], device="cuda", dtype=torch.float32)
+    col_bias = torch.randn(M, 1, device="cuda", dtype=torch.float32) * 0.1
+    row_scale = torch.randn(1, N, device="cuda", dtype=torch.float32) * 0.1
+    tile_bias = torch.randn(M, N, device="cuda", dtype=torch.float32) * 0.1
+
+    out = gemm_epilogue(
+        A_q,
+        W_q.mT,
+        _affine_aux_epilogue,
+        "nvfp4_global_scale_aux",
+        scale_a=A_sc,
+        scale_b=W_sc.mT,
+        out_dtype=torch.float32,
+        scale_a_global=scale_a_global,
+        scale_b_global=scale_b_global,
+        epilogue_args=(col_bias, row_scale, tile_bias),
+        epilogue_arg_kinds=("col", "row", "tile"),
+    )
+
+    A_ref = _dequant_nvfp4(A_packed, A_sc, K)
+    W_ref = _dequant_nvfp4(W_packed, W_sc, K)
+    ref = A_ref @ W_ref.T * scale_a_global.item() * scale_b_global.item()
+    expected = ((ref + col_bias) * row_scale + tile_bias).relu()
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
+
+
 def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
     _skip_if_not_sm100()
     from quack.gemm_blockscaled_interface import (

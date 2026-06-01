@@ -928,8 +928,35 @@ def compile_blockscaled_gemm_tvm_ffi(
             stream,
             options="--enable-tvm-ffi",
         )
+    elif aux_count == 4:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            epilogue_auxes: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+            varlen_args,
+            stream,
+        ):
+            gemm(a, b, None, None, make_epi_args(d, epilogue_auxes), scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            ordered_auxes,
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
     else:
-        raise NotImplementedError("blockscaled tensor epilogues currently support up to 3 captured aux tensors")
+        raise NotImplementedError("blockscaled tensor epilogues currently support up to 4 captured aux tensors")
 
     def ordered_runtime_auxes(row_auxes, col_auxes, tile_auxes):
         ordered = []

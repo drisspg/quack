@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from functools import lru_cache
 import os
 import weakref
 
@@ -109,6 +110,14 @@ def _grouped_mm_3d_2d_epilogue(
     return out
 
 
+@lru_cache(maxsize=128)
+def _with_pre_epilogue_scale(epilogue_fn: Callable) -> Callable:
+    def scaled_epilogue(acc, pre_epilogue_scale, *epilogue_args):
+        return epilogue_fn(acc * pre_epilogue_scale, *epilogue_args)
+
+    return scaled_epilogue
+
+
 def _infer_epilogue_arg_kind(a: Tensor, b: Tensor, arg: Tensor) -> str:
     m, n = a.shape[-2], b.shape[-1]
     if tuple(arg.shape) == (*a.shape[:-1], n):
@@ -201,6 +210,8 @@ def gemm_epilogue(
     main_output_transform: str | None = None,
     main_output_transform_group: int | None = None,
     concat_layout: tuple[str, ...] | None = None,
+    scale_a_global: Tensor | None = None,
+    scale_b_global: Tensor | None = None,
 ) -> Tensor:
     if tuned is None:
         tuned = os.getenv("QUACK_GEMM_EPILOGUE_TUNED", "0") == "1"
@@ -379,6 +390,20 @@ def gemm_epilogue(
         tile_auxes = tuple(
             arg for arg, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "tile"
         )
+        if scale_a_global is not None or scale_b_global is not None:
+            if scale_a_global is None or scale_b_global is None:
+                raise RuntimeError("scaled GEMM epilogue requires both global scales")
+            epilogue_fn = _with_pre_epilogue_scale(epilogue_fn)
+            epilogue_key = f"{epilogue_key}_pre_scaled"
+            epilogue_arg_kinds = ("row", *epilogue_arg_kinds)
+            global_scale = (
+                (scale_a_global * scale_b_global)
+                .reshape(1, 1)
+                .expand(1, b.shape[-1])
+                .contiguous()
+                .squeeze(0)
+            )
+            row_auxes = (global_scale, *row_auxes)
         return mxfp8_scaled_mm_epilogue(
             a,
             b,
