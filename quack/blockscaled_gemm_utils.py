@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_act import GemmActSm100
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
@@ -611,6 +611,11 @@ def compile_blockscaled_gemm_tvm_ffi(
     varlen_k: bool = False,
     tensor_epilogue_fn: Callable | None = None,
     tensor_epilogue_key: str | None = None,
+    tensor_epilogue_uses_c: bool = False,
+    tensor_epilogue_arg_kinds: tuple[int, ...] = (),
+    tensor_epilogue_rowvec_biases: tuple[torch.Tensor, ...] = (),
+    tensor_epilogue_colvec_biases: tuple[torch.Tensor, ...] = (),
+    tensor_epilogue_tile_biases: tuple[torch.Tensor, ...] = (),
 ) -> Callable:
     """Compile the SM100 blockscaled GEMM.
 
@@ -624,6 +629,18 @@ def compile_blockscaled_gemm_tvm_ffi(
         raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
 
+    tensor_epilogue_rowvec_biases = tuple(
+        _make_compile_tensor_like(tensor, torch2cute_dtype_map[tensor.dtype])
+        for tensor in tensor_epilogue_rowvec_biases
+    )
+    tensor_epilogue_colvec_biases = tuple(
+        _make_compile_tensor_like(tensor, torch2cute_dtype_map[tensor.dtype])
+        for tensor in tensor_epilogue_colvec_biases
+    )
+    tensor_epilogue_tile_biases = tuple(
+        _make_compile_tensor_like(tensor, torch2cute_dtype_map[tensor.dtype])
+        for tensor in tensor_epilogue_tile_biases
+    )
     GemmCls = GemmActSm100 if tensor_epilogue_fn is not None else GemmDefaultSm100
     gemm = partial(
         GemmCls,
@@ -631,7 +648,16 @@ def compile_blockscaled_gemm_tvm_ffi(
         use_clc_persistence=use_clc_persistence,
     )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
     compile_epi_args = (
-        gemm.EpilogueArguments(mD, None, tensor_epilogue_fn)
+        gemm.EpilogueArguments(
+            mD,
+            None,
+            tensor_epilogue_fn,
+            tensor_epilogue_uses_c=tensor_epilogue_uses_c,
+            tensor_epilogue_arg_kinds=tensor_epilogue_arg_kinds,
+            mTensorEpilogueRowVecBroadcasts=tensor_epilogue_rowvec_biases or None,
+            mTensorEpilogueColVecBroadcasts=tensor_epilogue_colvec_biases or None,
+            mTensorEpilogueTiles=tensor_epilogue_tile_biases or None,
+        )
         if tensor_epilogue_fn is not None
         else gemm.EpilogueArguments()
     )
@@ -707,46 +733,239 @@ def compile_blockscaled_gemm_tvm_ffi(
             mD.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD)
         )
 
-    @cute.jit
-    def runner(
-        a: cute.Tensor,
-        b: cute.Tensor,
-        d: cute.Tensor,
-        sfa: cute.Tensor,
-        sfb: cute.Tensor,
-        varlen_args,
-        stream,
-    ):
-        if cutlass.const_expr(tensor_epilogue_fn is not None):
-            epi_args = gemm.EpilogueArguments(d, None, tensor_epilogue_fn)
-            gemm(a, b, None, None, epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
-        else:
+    if tensor_epilogue_fn is None:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            varlen_args,
+            stream,
+        ):
             gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
 
-    compiled = cute.compile(
-        runner,
-        fake_mA,
-        fake_mB,
-        fake_mD,
-        _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
-        _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
-        varlen_args_fake,
-        stream,
-        options="--enable-tvm-ffi",
-    )
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+
+        if varlen_m or varlen_k:
+
+            def run(a, b, d, sfa, sfb, cu_seqlens):
+                varlen_args = VarlenArguments(
+                    mCuSeqlensM=cu_seqlens if varlen_m else None,
+                    mCuSeqlensK=cu_seqlens if varlen_k else None,
+                )
+                compiled(a, b, d, sfa, sfb, varlen_args)
+        else:
+
+            def run(a, b, d, sfa, sfb):
+                compiled(a, b, d, sfa, sfb, VarlenArguments())
+
+        return run
+
+    ordered_auxes = []
+    row_index = 0
+    col_index = 0
+    tile_index = 0
+    for arg_kind in tensor_epilogue_arg_kinds:
+        if arg_kind == 1:
+            ordered_auxes.append(tensor_epilogue_tile_biases[tile_index])
+            tile_index += 1
+        elif arg_kind == 2:
+            ordered_auxes.append(tensor_epilogue_rowvec_biases[row_index])
+            row_index += 1
+        elif arg_kind == 3:
+            ordered_auxes.append(tensor_epilogue_colvec_biases[col_index])
+            col_index += 1
+        else:
+            raise NotImplementedError(f"unsupported tensor epilogue arg kind: {arg_kind}")
+    ordered_auxes = tuple(ordered_auxes)
+
+    def split_auxes(epilogue_auxes):
+        row_auxes = []
+        col_auxes = []
+        tile_auxes = []
+        for i, arg_kind in enumerate(tensor_epilogue_arg_kinds):
+            if arg_kind == 1:
+                tile_auxes.append(epilogue_auxes[i])
+            elif arg_kind == 2:
+                row_auxes.append(epilogue_auxes[i])
+            elif arg_kind == 3:
+                col_auxes.append(epilogue_auxes[i])
+        return tuple(row_auxes), tuple(col_auxes), tuple(tile_auxes)
+
+    def make_epi_args(d, epilogue_auxes):
+        row_auxes, col_auxes, tile_auxes = split_auxes(epilogue_auxes)
+        return gemm.EpilogueArguments(
+            d,
+            None,
+            tensor_epilogue_fn,
+            tensor_epilogue_uses_c=tensor_epilogue_uses_c,
+            tensor_epilogue_arg_kinds=tensor_epilogue_arg_kinds,
+            mTensorEpilogueRowVecBroadcasts=row_auxes or None,
+            mTensorEpilogueColVecBroadcasts=col_auxes or None,
+            mTensorEpilogueTiles=tile_auxes or None,
+        )
+
+    aux_count = len(tensor_epilogue_arg_kinds)
+    if aux_count == 0:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            varlen_args,
+            stream,
+        ):
+            if cutlass.const_expr(tensor_epilogue_fn is not None):
+                gemm(a, b, None, None, make_epi_args(d, ()), scheduler_args, varlen_args, stream, sfa, sfb, None)
+            else:
+                gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+    elif aux_count == 1:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            epilogue_auxes: tuple[cute.Tensor],
+            varlen_args,
+            stream,
+        ):
+            gemm(a, b, None, None, make_epi_args(d, epilogue_auxes), scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            ordered_auxes,
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+    elif aux_count == 2:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            epilogue_auxes: tuple[cute.Tensor, cute.Tensor],
+            varlen_args,
+            stream,
+        ):
+            gemm(a, b, None, None, make_epi_args(d, epilogue_auxes), scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            ordered_auxes,
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+    elif aux_count == 3:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            epilogue_auxes: tuple[cute.Tensor, cute.Tensor, cute.Tensor],
+            varlen_args,
+            stream,
+        ):
+            gemm(a, b, None, None, make_epi_args(d, epilogue_auxes), scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            ordered_auxes,
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+    else:
+        raise NotImplementedError("blockscaled tensor epilogues currently support up to 3 captured aux tensors")
+
+    def ordered_runtime_auxes(row_auxes, col_auxes, tile_auxes):
+        ordered = []
+        row_index = 0
+        col_index = 0
+        tile_index = 0
+        for arg_kind in tensor_epilogue_arg_kinds:
+            if arg_kind == 1:
+                ordered.append(tile_auxes[tile_index])
+                tile_index += 1
+            elif arg_kind == 2:
+                ordered.append(row_auxes[row_index])
+                row_index += 1
+            elif arg_kind == 3:
+                ordered.append(col_auxes[col_index])
+                col_index += 1
+        return tuple(ordered)
 
     if varlen_m or varlen_k:
 
-        def run(a, b, d, sfa, sfb, cu_seqlens):
+        def run(a, b, d, sfa, sfb, row_auxes=(), col_auxes=(), tile_auxes=(), cu_seqlens=None):
             varlen_args = VarlenArguments(
                 mCuSeqlensM=cu_seqlens if varlen_m else None,
                 mCuSeqlensK=cu_seqlens if varlen_k else None,
             )
-            compiled(a, b, d, sfa, sfb, varlen_args)
+            if aux_count == 0:
+                compiled(a, b, d, sfa, sfb, varlen_args)
+            else:
+                compiled(a, b, d, sfa, sfb, ordered_runtime_auxes(row_auxes, col_auxes, tile_auxes), varlen_args)
     else:
 
-        def run(a, b, d, sfa, sfb):
-            compiled(a, b, d, sfa, sfb, VarlenArguments())
+        def run(a, b, d, sfa, sfb, row_auxes=(), col_auxes=(), tile_auxes=()):
+            if aux_count == 0:
+                compiled(a, b, d, sfa, sfb, VarlenArguments())
+            else:
+                compiled(a, b, d, sfa, sfb, ordered_runtime_auxes(row_auxes, col_auxes, tile_auxes), VarlenArguments())
 
     return run
 

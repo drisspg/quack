@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import cutlass
+import cutlass.cute as cute
 
 from quack.blockscaled_gemm_utils import (
     blockscaled_gemm_reference,
@@ -20,6 +21,11 @@ from quack.mx_utils import to_blocked
 
 def _identity_epilogue(x):
     return x
+
+
+def _affine_aux_epilogue(acc, col_bias, row_scale, tile_bias):
+    out = (acc + col_bias) * row_scale + tile_bias
+    return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
 
 
 def _skip_if_not_sm100():
@@ -643,6 +649,45 @@ def test_mxfp8_scaled_mm_epilogue_reuses_interface_scale_layout():
     )
     ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, **config)
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import (
+        mxfp8_gemm,
+        mxfp8_quantize,
+        mxfp8_scaled_mm_epilogue,
+    )
+
+    M, N, K = 128, 128, 256
+    torch.manual_seed(1)
+    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    B_q, B_sc = W_q.mT, W_sc.mT
+    col_bias = torch.randn(M, device="cuda", dtype=torch.float32) * 0.1
+    row_scale = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1
+    tile_bias = torch.randn(M, N, device="cuda", dtype=torch.float32) * 0.1
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
+        _affine_aux_epilogue,
+        "affine_aux",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("col", "row", "tile"),
+        epilogue_colvec_biases=(col_bias,),
+        epilogue_rowvec_biases=(row_scale,),
+        epilogue_tile_biases=(tile_bias,),
+        **config,
+    )
+    ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, out_dtype=torch.float32, **config)
+    expected = ((ref + col_bias[:, None]) * row_scale[None, :] + tile_bias).relu()
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
 
 
 @pytest.mark.parametrize("a_major", ["k", "m"])

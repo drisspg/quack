@@ -104,6 +104,10 @@ def _compile_epilogue_cached(
     sf_dtype_cutlass,
     tensor_epilogue_fn: Callable,
     tensor_epilogue_key: str,
+    tensor_epilogue_arg_kinds: Tuple[int, ...] = (),
+    tensor_epilogue_rowvec_dtypes: Tuple[torch.dtype, ...] = (),
+    tensor_epilogue_colvec_dtypes: Tuple[torch.dtype, ...] = (),
+    tensor_epilogue_tile_dtypes: Tuple[torch.dtype, ...] = (),
 ):
     dev = torch.device("cuda")
     rm = ceil_div(m, 128)
@@ -116,6 +120,18 @@ def _compile_epilogue_cached(
     fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
     fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
     fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
+    fake_row_auxes = tuple(
+        torch.empty(l, n, dtype=dtype, device=dev)
+        for dtype in tensor_epilogue_rowvec_dtypes
+    )
+    fake_col_auxes = tuple(
+        torch.empty(l, m, dtype=dtype, device=dev)
+        for dtype in tensor_epilogue_colvec_dtypes
+    )
+    fake_tile_auxes = tuple(
+        torch.empty(l, m, n, dtype=dtype, device=dev).permute(1, 2, 0)
+        for dtype in tensor_epilogue_tile_dtypes
+    )
     return compile_blockscaled_gemm_tvm_ffi(
         ab_dtype_cutlass,
         sf_dtype_cutlass,
@@ -130,6 +146,11 @@ def _compile_epilogue_cached(
         fake_mSFB,
         tensor_epilogue_fn=tensor_epilogue_fn,
         tensor_epilogue_key=tensor_epilogue_key,
+        tensor_epilogue_uses_c=bool(tensor_epilogue_arg_kinds),
+        tensor_epilogue_arg_kinds=tensor_epilogue_arg_kinds,
+        tensor_epilogue_rowvec_biases=fake_row_auxes,
+        tensor_epilogue_colvec_biases=fake_col_auxes,
+        tensor_epilogue_tile_biases=fake_tile_auxes,
     )
 
 
@@ -283,6 +304,10 @@ def mxfp8_scaled_mm_epilogue(
     *,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    epilogue_arg_kinds: tuple[str, ...] = (),
+    epilogue_rowvec_biases: tuple[Tensor, ...] = (),
+    epilogue_colvec_biases: tuple[Tensor, ...] = (),
+    epilogue_tile_biases: tuple[Tensor, ...] = (),
 ) -> Tensor:
     m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
     out_shape = (m, n) if was_2d else (l, m, n)
@@ -292,6 +317,18 @@ def mxfp8_scaled_mm_epilogue(
         tlr, clu = _default_tiler_cluster(m, n)
         mma_tiler_mn = mma_tiler_mn or tlr
         cluster_shape_mn = cluster_shape_mn or clu
+    row_auxes = tuple(
+        tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+        for tensor in epilogue_rowvec_biases
+    )
+    col_auxes = tuple(
+        tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+        for tensor in epilogue_colvec_biases
+    )
+    tile_auxes = tuple(
+        (tensor.unsqueeze(0) if tensor.ndim == 2 else tensor).permute(1, 2, 0)
+        for tensor in epilogue_tile_biases
+    )
     runner = _compile_epilogue_cached(
         m,
         n,
@@ -304,8 +341,12 @@ def mxfp8_scaled_mm_epilogue(
         cutlass.Float8E8M0FNU,
         epilogue_fn,
         epilogue_key,
+        tuple({"tile": 1, "row": 2, "col": 3}[kind] for kind in epilogue_arg_kinds),
+        tuple(tensor.dtype for tensor in row_auxes),
+        tuple(tensor.dtype for tensor in col_auxes),
+        tuple(tensor.dtype for tensor in tile_auxes),
     )
-    runner(mA, mB, mD, sfa, sfb)
+    runner(mA, mB, mD, sfa, sfb, row_auxes, col_auxes, tile_auxes)
     return out
 
 

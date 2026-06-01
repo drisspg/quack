@@ -366,6 +366,19 @@ def gemm_epilogue(
             raise RuntimeError("scaled GEMM epilogue requires both scale_a and scale_b")
         if C is not None or alpha != 1.0 or beta != 1.0:
             raise NotImplementedError("scaled GEMM epilogue does not support C/alpha/beta yet")
+        row_auxes = tuple(
+            arg.squeeze(0)
+            for arg, kind in zip(epilogue_args, epilogue_arg_kinds)
+            if kind == "row"
+        )
+        col_auxes = tuple(
+            arg.squeeze(-1)
+            for arg, kind in zip(epilogue_args, epilogue_arg_kinds)
+            if kind == "col"
+        )
+        tile_auxes = tuple(
+            arg for arg, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "tile"
+        )
         return mxfp8_scaled_mm_epilogue(
             a,
             b,
@@ -374,6 +387,10 @@ def gemm_epilogue(
             epilogue_fn,
             epilogue_key,
             out_dtype=a.dtype if out_dtype is None else out_dtype,
+            epilogue_arg_kinds=epilogue_arg_kinds,
+            epilogue_rowvec_biases=row_auxes,
+            epilogue_colvec_biases=col_auxes,
+            epilogue_tile_biases=tile_auxes,
         )
     if aux_out is not None and local_reduce_out is not None:
         raise NotImplementedError(
