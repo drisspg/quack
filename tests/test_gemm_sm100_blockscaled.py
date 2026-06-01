@@ -651,6 +651,36 @@ def test_mxfp8_scaled_mm_epilogue_reuses_interface_scale_layout():
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+def test_nvfp4_scaled_mm_epilogue_reuses_interface_scale_layout():
+    _skip_if_not_sm100()
+    from torch.testing._internal.common_quantized import _bfloat16_to_float4_e2m1fn_x2
+
+    from quack.gemm_blockscaled_interface import mxfp8_scaled_mm_epilogue
+
+    M, N, K = 128, 192, 256
+    A_q = _bfloat16_to_float4_e2m1fn_x2(
+        torch.eye(M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    W_q = _bfloat16_to_float4_e2m1fn_x2(
+        torch.eye(N, K, device="cuda", dtype=torch.bfloat16)
+    )
+    A_sc = torch.full((2048,), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
+    W_sc = torch.full((4096,), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        W_q.mT,
+        A_sc,
+        W_sc,
+        _identity_epilogue,
+        "nvfp4_identity",
+    )
+
+    torch.testing.assert_close(
+        out, torch.eye(M, N, device="cuda", dtype=torch.bfloat16), atol=0, rtol=0
+    )
+
+
 def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
     _skip_if_not_sm100()
     from quack.gemm_blockscaled_interface import (

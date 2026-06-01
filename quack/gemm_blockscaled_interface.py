@@ -35,12 +35,41 @@ from quack.blockscaled_gemm_utils import (
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.mx_utils import to_mx
 
-_SF_VEC_SIZE = 32
+_MXFP8_SF_VEC_SIZE = 32
+_NVFP4_SF_VEC_SIZE = 16
 _TORCH_TO_CUTLASS_D = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
     torch.float32: cutlass.Float32,
 }
+_TORCH_TO_CUTLASS_AB = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+}
+
+
+def _blockscaled_format(
+    a_dtype: torch.dtype, scale_dtype: torch.dtype
+) -> tuple[int, cutlass.Numeric, cutlass.Numeric]:
+    if a_dtype == torch.float8_e4m3fn and scale_dtype == torch.float8_e8m0fnu:
+        return _MXFP8_SF_VEC_SIZE, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+    if a_dtype == torch.float4_e2m1fn_x2 and scale_dtype == torch.float8_e4m3fn:
+        return _NVFP4_SF_VEC_SIZE, cutlass.Float4E2M1FN, cutlass.Float8E4M3FN
+    raise AssertionError(f"unsupported blockscaled dtype pair: {a_dtype}, {scale_dtype}")
+
+
+def _logical_k(tensor: Tensor) -> int:
+    return tensor.shape[-1] * 2 if tensor.dtype == torch.float4_e2m1fn_x2 else tensor.shape[-1]
+
+
+def _packed_k(logical_k: int, dtype: torch.dtype) -> int:
+    return logical_k // 2 if dtype == torch.float4_e2m1fn_x2 else logical_k
+
+
+def _fake_operand(dev, l, mn, logical_k, dtype):
+    return torch.empty(
+        l, mn, _packed_k(logical_k, dtype), dtype=dtype, device=dev
+    ).permute(1, 2, 0)
 
 
 def _default_tiler_cluster(m: int, n: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
@@ -59,27 +88,28 @@ def _compile_cached(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     out_torch_dtype,
+    ab_torch_dtype,
+    sf_torch_dtype,
     ab_dtype_cutlass,
     sf_dtype_cutlass,
+    sf_vec_size,
 ):
     """Compile kernel for a given (shape, dtype, tiler, cluster) and cache it."""
     dev = torch.device("cuda")
     rm = ceil_div(m, 128)
     rn = ceil_div(n, 128)
-    rk = ceil_div(k // _SF_VEC_SIZE, 4)
-    # K-major: (l, m, k) contiguous, viewed as (m, k, l) strides (k, 1, m*k)
-    fake_mA = torch.empty(l, m, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
-    fake_mB = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
-    # N-major: (l, m, n) contiguous, viewed as (m, n, l) strides (n, 1, m*n)
+    rk = ceil_div(k // sf_vec_size, 4)
+    fake_mA = _fake_operand(dev, l, m, k, ab_torch_dtype)
+    fake_mB = _fake_operand(dev, l, n, k, ab_torch_dtype)
     fake_mD = torch.empty(l, m, n, dtype=out_torch_dtype, device=dev).permute(1, 2, 0)
-    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
-    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
+    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=sf_torch_dtype, device=dev)
+    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=sf_torch_dtype, device=dev)
+    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // sf_vec_size, l)
+    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // sf_vec_size, l)
     return compile_blockscaled_gemm_tvm_ffi(
         ab_dtype_cutlass,
         sf_dtype_cutlass,
-        _SF_VEC_SIZE,
+        sf_vec_size,
         _TORCH_TO_CUTLASS_D[out_torch_dtype],
         mma_tiler_mn,
         cluster_shape_mn,
@@ -100,8 +130,11 @@ def _compile_epilogue_cached(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     out_torch_dtype,
+    ab_torch_dtype,
+    sf_torch_dtype,
     ab_dtype_cutlass,
     sf_dtype_cutlass,
+    sf_vec_size,
     tensor_epilogue_fn: Callable,
     tensor_epilogue_key: str,
     tensor_epilogue_arg_kinds: Tuple[int, ...] = (),
@@ -112,14 +145,14 @@ def _compile_epilogue_cached(
     dev = torch.device("cuda")
     rm = ceil_div(m, 128)
     rn = ceil_div(n, 128)
-    rk = ceil_div(k // _SF_VEC_SIZE, 4)
-    fake_mA = torch.empty(l, m, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
-    fake_mB = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    rk = ceil_div(k // sf_vec_size, 4)
+    fake_mA = _fake_operand(dev, l, m, k, ab_torch_dtype)
+    fake_mB = _fake_operand(dev, l, n, k, ab_torch_dtype)
     fake_mD = torch.empty(l, m, n, dtype=out_torch_dtype, device=dev).permute(1, 2, 0)
-    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
-    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
+    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=sf_torch_dtype, device=dev)
+    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=sf_torch_dtype, device=dev)
+    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // sf_vec_size, l)
+    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // sf_vec_size, l)
     fake_row_auxes = tuple(
         torch.empty(l, n, dtype=dtype, device=dev)
         for dtype in tensor_epilogue_rowvec_dtypes
@@ -135,7 +168,7 @@ def _compile_epilogue_cached(
     return compile_blockscaled_gemm_tvm_ffi(
         ab_dtype_cutlass,
         sf_dtype_cutlass,
-        _SF_VEC_SIZE,
+        sf_vec_size,
         _TORCH_TO_CUTLASS_D[out_torch_dtype],
         mma_tiler_mn,
         cluster_shape_mn,
@@ -182,24 +215,29 @@ def _to_kernel_layout(
     A: (M,K) or (L,M,K) K-contig.  B: (K,N) or (L,K,N) K-contig.
     A_scale: (M,K/32) or (L,M,K/32) K-contig.  B_scale: (K/32,N) or (L,K/32,N) K-contig.
     """
-    assert A.dtype == torch.float8_e4m3fn, f"A dtype must be float8_e4m3fn, got {A.dtype}"
-    assert B.dtype == torch.float8_e4m3fn, f"B dtype must be float8_e4m3fn, got {B.dtype}"
-    assert A_scale.dtype == torch.float8_e8m0fnu
-    assert B_scale.dtype == torch.float8_e8m0fnu
+    assert A.dtype in _TORCH_TO_CUTLASS_AB, f"unsupported A dtype: {A.dtype}"
+    assert B.dtype == A.dtype, f"B dtype must match A dtype, got {B.dtype} vs {A.dtype}"
+    assert A_scale.dtype == B_scale.dtype
+    sf_vec_size, ab_dtype_cutlass, sf_dtype_cutlass = _blockscaled_format(
+        A.dtype, A_scale.dtype
+    )
     was_2d = A.dim() == 2
     # Flip B from (K,N) to (N,K) via .mT (zero-copy). User's B K-contig → .mT K-contig.
-    A3 = _as_3d(A, A.dim())  # (l, m, k) K-contig row-major expected
-    B3 = _as_3d(B, B.dim()).mT  # (l, n, k) K-contig (view) from (l, k, n)
-    l, m, k = A3.shape
-    l2, n, k2 = B3.shape
+    A3 = _as_3d(A, A.dim())
+    B3 = _as_3d(B, B.dim()).mT
+    l, m, packed_k = A3.shape
+    l2, n, packed_k2 = B3.shape
+    k = _logical_k(A3)
+    k2 = _logical_k(B3)
     assert l == l2, f"batch mismatch: A={l}, B={l2}"
     assert k == k2, f"K mismatch: A K={k}, B K={k2}"
-    assert k % _SF_VEC_SIZE == 0, f"K ({k}) must be divisible by {_SF_VEC_SIZE}"
+    assert packed_k == packed_k2
+    assert k % sf_vec_size == 0, f"K ({k}) must be divisible by {sf_vec_size}"
     assert A3.stride(-1) == 1, "A must be K-contiguous (stride 1 on K)"
     assert B3.stride(-1) == 1, (
         "B must be K-contiguous on its K axis (pass .mT of an (N,K) row-major tensor)"
     )
-    sf_k = k // _SF_VEC_SIZE
+    sf_k = k // sf_vec_size
     if A_scale.dim() == 1:
         sc_contig_A = _blocked_scale_1d_view(A_scale, m, sf_k, l)
     else:
@@ -231,7 +269,22 @@ def _to_kernel_layout(
     mB_nkl = B3_c.permute(1, 2, 0)
     sfa_view = scale_view_for_kernel(sc_contig_A, m, sf_k, l)
     sfb_view = scale_view_for_kernel(sc_contig_B, n, sf_k, l)
-    return m, n, k, l, mA_mkl, mB_nkl, sc_contig_A, sc_contig_B, sfa_view, sfb_view, was_2d
+    return (
+        m,
+        n,
+        k,
+        l,
+        mA_mkl,
+        mB_nkl,
+        sc_contig_A,
+        sc_contig_B,
+        sfa_view,
+        sfb_view,
+        was_2d,
+        sf_vec_size,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+    )
 
 
 def mxfp8_gemm_out(
@@ -245,7 +298,22 @@ def mxfp8_gemm_out(
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> None:
     """MXFP8 blockscaled GEMM with pre-allocated output. See module doc for shape conventions."""
-    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    (
+        m,
+        n,
+        k,
+        l,
+        mA,
+        mB,
+        _scA,
+        _scB,
+        sfa,
+        sfb,
+        was_2d,
+        sf_vec_size,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+    ) = _to_kernel_layout(A, B, A_scale, B_scale)
     out_dtype = out.dtype
     assert out_dtype in _TORCH_TO_CUTLASS_D, f"unsupported out dtype: {out_dtype}"
     expected_out_shape = (m, n) if was_2d else (l, m, n)
@@ -261,9 +329,9 @@ def mxfp8_gemm_out(
         mma_tiler_mn = mma_tiler_mn or tlr
         cluster_shape_mn = cluster_shape_mn or clu
     if not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        _SF_VEC_SIZE,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+        sf_vec_size,
         _TORCH_TO_CUTLASS_D[out_dtype],
         mma_tiler_mn,
         cluster_shape_mn,
@@ -287,8 +355,11 @@ def mxfp8_gemm_out(
         mma_tiler_mn,
         cluster_shape_mn,
         out_dtype,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
+        A.dtype,
+        A_scale.dtype,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+        sf_vec_size,
     )
     runner(mA, mB, mD, sfa, sfb)
 
@@ -309,14 +380,54 @@ def mxfp8_scaled_mm_epilogue(
     epilogue_colvec_biases: tuple[Tensor, ...] = (),
     epilogue_tile_biases: tuple[Tensor, ...] = (),
 ) -> Tensor:
-    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    (
+        m,
+        n,
+        k,
+        l,
+        mA,
+        mB,
+        _scA,
+        _scB,
+        sfa,
+        sfb,
+        was_2d,
+        sf_vec_size,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+    ) = _to_kernel_layout(A, B, A_scale, B_scale)
     out_shape = (m, n) if was_2d else (l, m, n)
     out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     mD = (out.unsqueeze(0) if was_2d else out).permute(1, 2, 0)
     if mma_tiler_mn is None or cluster_shape_mn is None:
-        tlr, clu = _default_tiler_cluster(m, n)
+        if (
+            ab_dtype_cutlass == cutlass.Float4E2M1FN
+            and sf_dtype_cutlass == cutlass.Float8E4M3FN
+        ):
+            tlr, clu = (128, 192), (1, 1)
+        else:
+            tlr, clu = _default_tiler_cluster(m, n)
         mma_tiler_mn = mma_tiler_mn or tlr
         cluster_shape_mn = cluster_shape_mn or clu
+    if not GemmDefaultSm100.can_implement_blockscaled(
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+        sf_vec_size,
+        _TORCH_TO_CUTLASS_D[out_dtype],
+        mma_tiler_mn,
+        cluster_shape_mn,
+        m,
+        n,
+        k,
+        l,
+        "k",
+        "k",
+        "n",
+    ):
+        raise ValueError(
+            f"unsupported config: m={m}, n={n}, k={k}, l={l}, "
+            f"tiler={mma_tiler_mn}, cluster={cluster_shape_mn}"
+        )
     row_auxes = tuple(
         tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
         for tensor in epilogue_rowvec_biases
@@ -337,8 +448,11 @@ def mxfp8_scaled_mm_epilogue(
         mma_tiler_mn,
         cluster_shape_mn,
         out_dtype,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
+        A.dtype,
+        A_scale.dtype,
+        ab_dtype_cutlass,
+        sf_dtype_cutlass,
+        sf_vec_size,
         epilogue_fn,
         epilogue_key,
         tuple({"tile": 1, "row": 2, "col": 3}[kind] for kind in epilogue_arg_kinds),
@@ -384,10 +498,10 @@ def mxfp8_gemm(
 def mxfp8_quantize(x: Tensor) -> Tuple[Tensor, Tensor]:
     """Quantize a (..., K) bf16/fp32 tensor to MXFP8. Returns (qdata, scale_2d)
     in torchao-convention layout. Last dim (K) must be divisible by 32."""
-    assert x.shape[-1] % _SF_VEC_SIZE == 0, (
-        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE}"
+    assert x.shape[-1] % _MXFP8_SF_VEC_SIZE == 0, (
+        f"last dim ({x.shape[-1]}) must be divisible by {_MXFP8_SF_VEC_SIZE}"
     )
-    return to_mx(x.contiguous(), _SF_VEC_SIZE)
+    return to_mx(x.contiguous(), _MXFP8_SF_VEC_SIZE)
 
 
 def mxfp8_gemm_quantize(
@@ -426,13 +540,28 @@ def mxfp8_gemm_cublas(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Reference path via torch._scaled_mm. Requires l=1 (or 2D inputs)."""
-    m, n, k, l, _mA, _mB, sc_A, sc_B, _sfa, _sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    (
+        m,
+        n,
+        k,
+        l,
+        _mA,
+        _mB,
+        sc_A,
+        sc_B,
+        _sfa,
+        _sfb,
+        was_2d,
+        sf_vec_size,
+        _ab_dtype_cutlass,
+        _sf_dtype_cutlass,
+    ) = _to_kernel_layout(A, B, A_scale, B_scale)
     assert l == 1, "torch._scaled_mm MXFP8 path is 2D only; pass 2D inputs or l=1"
     # torch._scaled_mm: A=(M,K) row-major, B=(K,N) col-major (both K-contig) -- same layout user gave us.
     a2d = A if A.dim() == 2 else A.squeeze(0)
     b2d = B if B.dim() == 2 else B.squeeze(0)
-    sca = scale_blocked_for_cublas(sc_A, m, k // _SF_VEC_SIZE, 0)
-    scb = scale_blocked_for_cublas(sc_B, n, k // _SF_VEC_SIZE, 0)
+    sca = scale_blocked_for_cublas(sc_A, m, k // sf_vec_size, 0)
+    scb = scale_blocked_for_cublas(sc_B, n, k // sf_vec_size, 0)
     out = torch._scaled_mm(
         a2d,
         b2d,
@@ -458,7 +587,7 @@ def mxfp8_gemm_ref(
     B3 = _as_3d(B, B.dim()).mT.contiguous().float()
     as3 = _as_3d(A_scale, A_scale.dim()).float()
     bs3 = _as_3d(B_scale, B_scale.dim()).mT.contiguous().float()
-    a_dq = A3 * as3.repeat_interleave(_SF_VEC_SIZE, dim=-1)
-    b_dq = B3 * bs3.repeat_interleave(_SF_VEC_SIZE, dim=-1)
+    a_dq = A3 * as3.repeat_interleave(_MXFP8_SF_VEC_SIZE, dim=-1)
+    b_dq = B3 * bs3.repeat_interleave(_MXFP8_SF_VEC_SIZE, dim=-1)
     out3 = torch.einsum("lmk,lnk->lmn", a_dq, b_dq).to(out_dtype)
     return out3.squeeze(0) if was_2d else out3
