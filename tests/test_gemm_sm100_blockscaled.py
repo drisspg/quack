@@ -760,6 +760,52 @@ def test_nvfp4_scaled_mm_epilogue_global_scales_compose_with_aux_tensors():
     torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
 
 
+def _many_aux_epilogue(acc, row0, row1, col0, col1, tile0, tile1):
+    out = acc + row0 + row1 + col0 + col1 + tile0 + tile1
+    return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
+
+
+def test_mxfp8_scaled_mm_epilogue_reads_many_captured_aux_tensors():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import (
+        mxfp8_gemm,
+        mxfp8_quantize,
+        mxfp8_scaled_mm_epilogue,
+    )
+
+    M, N, K = 128, 128, 256
+    torch.manual_seed(4)
+    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    row0 = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1
+    row1 = torch.randn(N, device="cuda", dtype=torch.float32) * 0.1
+    col0 = torch.randn(M, device="cuda", dtype=torch.float32) * 0.1
+    col1 = torch.randn(M, device="cuda", dtype=torch.float32) * 0.1
+    tile0 = torch.randn(M, N, device="cuda", dtype=torch.float32) * 0.1
+    tile1 = torch.randn(M, N, device="cuda", dtype=torch.float32) * 0.1
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        W_q.mT,
+        A_sc,
+        W_sc.mT,
+        _many_aux_epilogue,
+        "many_aux",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "row", "col", "col", "tile", "tile"),
+        epilogue_rowvec_biases=(row0, row1),
+        epilogue_colvec_biases=(col0, col1),
+        epilogue_tile_biases=(tile0, tile1),
+        **config,
+    )
+    ref = mxfp8_gemm(A_q, W_q.mT, A_sc, W_sc.mT, out_dtype=torch.float32, **config)
+    expected = (ref + row0 + row1 + col0[:, None] + col1[:, None] + tile0 + tile1).relu()
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
+
+
 def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
     _skip_if_not_sm100()
     from quack.gemm_blockscaled_interface import (
