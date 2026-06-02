@@ -1191,9 +1191,23 @@ def test_blockscaled_mxfp8_varlen_m_epilogue_reads_aux_tensors():
             b_major="k",
         )
     )
+    assert (b_sc_contig.view(torch.uint8) != 127).any()
     total_m = int(sum(seqlens_m))
-    row_bias = torch.randn(num_experts, n, device="cuda", dtype=torch.float32) * 0.1
-    col_scale = torch.randn(total_m, device="cuda", dtype=torch.float32) * 0.1
+    row_bias = torch.testing.make_tensor(
+        num_experts,
+        n,
+        dtype=torch.float32,
+        device="cuda",
+        low=-0.1,
+        high=0.1,
+    )
+    col_scale = torch.testing.make_tensor(
+        total_m,
+        dtype=torch.float32,
+        device="cuda",
+        low=-0.1,
+        high=0.1,
+    )
     from quack.gemm_blockscaled_interface import mxfp8_varlen_m_scaled_mm_epilogue
 
     out = mxfp8_varlen_m_scaled_mm_epilogue(
@@ -1233,8 +1247,24 @@ def test_blockscaled_mxfp8_varlen_k_epilogue_reads_aux_tensors():
     a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
         create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
     )
-    row_bias = torch.randn(num_experts, n, device="cuda", dtype=torch.float32)
-    col_scale = torch.randn(num_experts, m, device="cuda", dtype=torch.float32)
+    assert (a_sc_contig.view(torch.uint8) != 127).any()
+    assert (b_sc_contig.view(torch.uint8) != 127).any()
+    row_bias = torch.testing.make_tensor(
+        num_experts,
+        n,
+        dtype=torch.float32,
+        device="cuda",
+        low=-1.0,
+        high=1.0,
+    )
+    col_scale = torch.testing.make_tensor(
+        num_experts,
+        m,
+        dtype=torch.float32,
+        device="cuda",
+        low=-1.0,
+        high=1.0,
+    )
     from quack.gemm_blockscaled_interface import mxfp8_varlen_k_scaled_mm_epilogue
 
     out = mxfp8_varlen_k_scaled_mm_epilogue(

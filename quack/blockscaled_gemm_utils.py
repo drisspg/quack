@@ -442,7 +442,14 @@ def create_blockscaled_varlen_m_operands(
 
     # Quantize A: (total_m, k) bf16 -> (total_m, k) fp8 K-major.
     # A data itself is stored packed (no per-expert padding); only SFA is padded.
-    a_hp = (torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
+    a_hp = torch.testing.make_tensor(
+        total_m,
+        k,
+        dtype=torch.bfloat16,
+        device="cuda",
+        low=-std,
+        high=std,
+    ).contiguous()
     qa, sa_2d = to_fn(a_hp, sf_vec_size)  # (total_m, k), (total_m, sf_k)
     a_ref = qa.float() * sa_2d.float().repeat_interleave(sf_vec_size, dim=-1)
 
@@ -466,7 +473,15 @@ def create_blockscaled_varlen_m_operands(
     # Quantize B: (num_experts, n, k) bf16 -> (n, k, num_experts). b_major selects
     # k-major (stride (k, 1, n*k)) or n-major (stride (1, n, n*k)).
     assert b_major in ("k", "n"), f"b_major must be 'k' or 'n', got {b_major!r}"
-    b_hp = (torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
+    b_hp = torch.testing.make_tensor(
+        num_experts,
+        n,
+        k,
+        dtype=torch.bfloat16,
+        device="cuda",
+        low=-std,
+        high=std,
+    ).contiguous()
     qb_flat, sb_2d = to_fn(b_hp.view(num_experts * n, k), sf_vec_size)
     if b_major == "k":
         qb = (
@@ -544,13 +559,27 @@ def create_blockscaled_varlen_k_operands(
     b_q_list, b_sc_list, b_ref_list = [], [], []
     for k_i in seqlens_k:
         # A slice: (m, k_i) bf16 -> fp8, scales (m, k_i // sf_vec_size).
-        a_hp = (torch.randn(m, k_i, dtype=torch.bfloat16, device="cuda") * std).contiguous()
+        a_hp = torch.testing.make_tensor(
+            m,
+            k_i,
+            dtype=torch.bfloat16,
+            device="cuda",
+            low=-std,
+            high=std,
+        ).contiguous()
         a_q, a_sc = to_mx_compiled(a_hp, sf_vec_size)
         a_q_list.append(a_q)
         a_sc_list.append(a_sc)
         a_ref_list.append(a_q.float() * a_sc.float().repeat_interleave(sf_vec_size, dim=-1))
 
-        b_hp = (torch.randn(n, k_i, dtype=torch.bfloat16, device="cuda") * std).contiguous()
+        b_hp = torch.testing.make_tensor(
+            n,
+            k_i,
+            dtype=torch.bfloat16,
+            device="cuda",
+            low=-std,
+            high=std,
+        ).contiguous()
         b_q, b_sc = to_mx_compiled(b_hp, sf_vec_size)
         b_q_list.append(b_q)
         b_sc_list.append(b_sc)
