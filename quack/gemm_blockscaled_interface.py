@@ -46,6 +46,11 @@ _TORCH_TO_CUTLASS_AB = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
 }
+_EPILOGUE_ARG_KIND_TO_CODE = {"tile": 1, "row": 2, "col": 3}
+
+
+def _epilogue_arg_kind_codes(epilogue_arg_kinds: tuple[str, ...]) -> tuple[int, ...]:
+    return tuple(_EPILOGUE_ARG_KIND_TO_CODE[kind] for kind in epilogue_arg_kinds)
 
 
 def _blockscaled_format(
@@ -462,6 +467,136 @@ def mxfp8_scaled_mm_epilogue(
     )
     runner(mA, mB, mD, sfa, sfb, row_auxes, col_auxes, tile_auxes)
     return out
+
+
+def mxfp8_varlen_m_scaled_mm_epilogue(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    offs: Tensor,
+    epilogue_fn: Callable,
+    epilogue_key: str,
+    out_dtype: torch.dtype = torch.bfloat16,
+    *,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    epilogue_arg_kinds: tuple[str, ...] = (),
+    epilogue_rowvec_biases: tuple[Tensor, ...] = (),
+    epilogue_colvec_biases: tuple[Tensor, ...] = (),
+) -> Tensor:
+    assert A.dim() == 2, f"varlen-M A must be (total_m, k), got {tuple(A.shape)}"
+    assert B.dim() == 3, f"varlen-M B must be (n, k, groups), got {tuple(B.shape)}"
+    assert offs.dtype is torch.int32, f"offs must be int32, got {offs.dtype}"
+    assert A.dtype == torch.float8_e4m3fn and B.dtype == torch.float8_e4m3fn
+    assert A_scale.dtype == torch.float8_e8m0fnu and B_scale.dtype == torch.float8_e8m0fnu
+    total_m, k = A.shape
+    n, k_b, groups = B.shape
+    assert k == k_b
+    assert offs.numel() == groups
+    out = torch.empty(total_m, n, dtype=out_dtype, device=A.device)
+    if mma_tiler_mn is None or cluster_shape_mn is None:
+        mma_tiler_mn = mma_tiler_mn or (128, 128)
+        cluster_shape_mn = cluster_shape_mn or (1, 1)
+    row_auxes = tuple(
+        tensor.expand(groups, n).contiguous() if tensor.ndim == 1 else tensor
+        for tensor in epilogue_rowvec_biases
+    )
+    col_auxes = epilogue_colvec_biases
+    runner = compile_blockscaled_gemm_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        _MXFP8_SF_VEC_SIZE,
+        _TORCH_TO_CUTLASS_D[out_dtype],
+        mma_tiler_mn,
+        cluster_shape_mn,
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        varlen_m=True,
+        tensor_epilogue_fn=epilogue_fn,
+        tensor_epilogue_key=epilogue_key,
+        tensor_epilogue_uses_c=bool(epilogue_arg_kinds),
+        tensor_epilogue_arg_kinds=_epilogue_arg_kind_codes(epilogue_arg_kinds),
+        tensor_epilogue_rowvec_biases=row_auxes,
+        tensor_epilogue_colvec_biases=col_auxes,
+    )
+    cu_seqlens = torch.cat((offs.new_zeros(1), offs))
+    runner(
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        row_auxes=row_auxes,
+        col_auxes=col_auxes,
+        cu_seqlens=cu_seqlens,
+    )
+    return out
+
+
+def mxfp8_varlen_k_scaled_mm_epilogue(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    offs: Tensor,
+    epilogue_fn: Callable,
+    epilogue_key: str,
+    out_dtype: torch.dtype = torch.bfloat16,
+    *,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    epilogue_arg_kinds: tuple[str, ...] = (),
+    epilogue_rowvec_biases: tuple[Tensor, ...] = (),
+    epilogue_colvec_biases: tuple[Tensor, ...] = (),
+) -> Tensor:
+    assert A.dim() == 2 and B.dim() == 2
+    assert offs.dtype is torch.int32, f"offs must be int32, got {offs.dtype}"
+    assert A.dtype == torch.float8_e4m3fn and B.dtype == torch.float8_e4m3fn
+    assert A_scale.dtype == torch.float8_e8m0fnu and B_scale.dtype == torch.float8_e8m0fnu
+    m, total_k = A.shape
+    n, total_k_b = B.shape
+    assert total_k == total_k_b
+    groups = offs.numel()
+    out = torch.empty(groups, m, n, dtype=out_dtype, device=A.device).permute(1, 2, 0)
+    if mma_tiler_mn is None or cluster_shape_mn is None:
+        mma_tiler_mn = mma_tiler_mn or (128, 128)
+        cluster_shape_mn = cluster_shape_mn or (1, 1)
+    runner = compile_blockscaled_gemm_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        _MXFP8_SF_VEC_SIZE,
+        _TORCH_TO_CUTLASS_D[out_dtype],
+        mma_tiler_mn,
+        cluster_shape_mn,
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        varlen_k=True,
+        tensor_epilogue_fn=epilogue_fn,
+        tensor_epilogue_key=epilogue_key,
+        tensor_epilogue_uses_c=bool(epilogue_arg_kinds),
+        tensor_epilogue_arg_kinds=_epilogue_arg_kind_codes(epilogue_arg_kinds),
+        tensor_epilogue_rowvec_biases=epilogue_rowvec_biases,
+        tensor_epilogue_colvec_biases=epilogue_colvec_biases,
+    )
+    cu_seqlens = torch.cat((offs.new_zeros(1), offs))
+    runner(
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        row_auxes=epilogue_rowvec_biases,
+        col_auxes=epilogue_colvec_biases,
+        cu_seqlens=cu_seqlens,
+    )
+    return out.permute(2, 0, 1).contiguous()
 
 
 def mxfp8_gemm(

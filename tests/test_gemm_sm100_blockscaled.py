@@ -29,6 +29,11 @@ def _affine_aux_epilogue(acc, col_bias, row_scale, tile_bias):
     return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
 
 
+def _varlen_affine_epilogue(acc, row_bias, col_scale):
+    out = (acc + row_bias) * col_scale
+    return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
+
+
 def _dequant_nvfp4(q_packed, scale, logical_k):
     codes_lo = (q_packed & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
     codes_hi = ((q_packed >> 4) & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
@@ -1166,6 +1171,90 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
         out_i = mD[:, :, i].float()
         err = (out_i - ref_i).abs().max().item()
         assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
+def test_blockscaled_mxfp8_varlen_m_epilogue_reads_aux_tensors():
+    _skip_if_not_sm100()
+    seqlens_m = [100, 200, 150]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    sf_vec = 32
+    torch.manual_seed(7)
+    a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
+        create_blockscaled_varlen_m_operands(
+            num_experts,
+            0,
+            n,
+            k,
+            sf_vec,
+            seqlens_m=seqlens_m,
+            b_major="k",
+        )
+    )
+    total_m = int(sum(seqlens_m))
+    row_bias = torch.randn(num_experts, n, device="cuda", dtype=torch.float32) * 0.1
+    col_scale = torch.randn(total_m, device="cuda", dtype=torch.float32) * 0.1
+    from quack.gemm_blockscaled_interface import mxfp8_varlen_m_scaled_mm_epilogue
+
+    out = mxfp8_varlen_m_scaled_mm_epilogue(
+        mA,
+        mB,
+        a_sc_contig,
+        b_sc_contig,
+        cu_seqlens_m[1:],
+        _varlen_affine_epilogue,
+        "varlen_m_affine",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+
+    cu = cu_seqlens_m.tolist()
+    expected = torch.cat(
+        [
+            (
+                (a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T + row_bias[i])
+                * col_scale[cu[i] : cu[i + 1], None]
+            ).relu()
+            for i in range(num_experts)
+        ]
+    )
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
+
+
+def test_blockscaled_mxfp8_varlen_k_epilogue_reads_aux_tensors():
+    _skip_if_not_sm100()
+    seqlens_k = [96, 160, 128]
+    num_experts = len(seqlens_k)
+    m, n = 256, 256
+    sf_vec = 32
+    torch.manual_seed(8)
+    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
+        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
+    )
+    row_bias = torch.randn(num_experts, n, device="cuda", dtype=torch.float32)
+    col_scale = torch.randn(num_experts, m, device="cuda", dtype=torch.float32)
+    from quack.gemm_blockscaled_interface import mxfp8_varlen_k_scaled_mm_epilogue
+
+    out = mxfp8_varlen_k_scaled_mm_epilogue(
+        mA,
+        mB,
+        a_sc_contig,
+        b_sc_contig,
+        cu_seqlens_k[1:],
+        _varlen_affine_epilogue,
+        "varlen_k_affine",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        expected_i = ((ref_i + row_bias[i]) * col_scale[i][:, None]).relu()
+        torch.testing.assert_close(out[i], expected_i, atol=2e-1, rtol=5e-2)
 
 
 @pytest.mark.parametrize("rk_pad", [1, 3, 5])
