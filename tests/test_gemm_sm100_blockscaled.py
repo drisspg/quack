@@ -765,6 +765,44 @@ def _many_aux_epilogue(acc, row0, row1, col0, col1, tile0, tile1):
     return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
 
 
+def _row_aux_stress_epilogue(acc, row0, row1, row2, row3, row4, row5, row6, row7):
+    out = acc + row0 - row1 + row2 - row3 + row4 - row5 + row6 - row7
+    return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
+
+
+def _mixed_aux_stress_epilogue(
+    acc, row0, tile0, col0, row1, col1, tile1, tile2, row2, col2, row3, tile3, col3
+):
+    out = (
+        acc
+        + row0
+        + tile0
+        + col0
+        - row1
+        + col1
+        - tile1
+        + tile2
+        + row2
+        - col2
+        + row3
+        + tile3
+        + col3
+    )
+    return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
+
+
+def _make_mxfp8_scaled_mm_inputs(seed):
+    from quack.gemm_blockscaled_interface import mxfp8_quantize
+
+    M, N, K = 128, 128, 256
+    torch.manual_seed(seed)
+    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    return M, N, A_q, W_q.mT, A_sc, W_sc.mT
+
+
 def test_mxfp8_scaled_mm_epilogue_reads_many_captured_aux_tensors():
     _skip_if_not_sm100()
     from quack.gemm_blockscaled_interface import (
@@ -804,6 +842,94 @@ def test_mxfp8_scaled_mm_epilogue_reads_many_captured_aux_tensors():
     ref = mxfp8_gemm(A_q, W_q.mT, A_sc, W_sc.mT, out_dtype=torch.float32, **config)
     expected = (ref + row0 + row1 + col0[:, None] + col1[:, None] + tile0 + tile1).relu()
     torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
+
+
+def test_mxfp8_scaled_mm_epilogue_reads_eight_row_aux_tensors():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_scaled_mm_epilogue
+
+    M, N, A_q, B_q, A_sc, B_sc = _make_mxfp8_scaled_mm_inputs(5)
+    row_auxes = tuple(
+        torch.randn(N, device="cuda", dtype=torch.float32) * 0.05 for _ in range(8)
+    )
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
+        _row_aux_stress_epilogue,
+        "row_aux_stress",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row",) * len(row_auxes),
+        epilogue_rowvec_biases=row_auxes,
+        **config,
+    )
+    ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, out_dtype=torch.float32, **config)
+    expected = ref
+    for index, row_aux in enumerate(row_auxes):
+        expected = expected + row_aux.float() if index % 2 == 0 else expected - row_aux.float()
+    torch.testing.assert_close(out, expected.relu(), atol=2e-1, rtol=5e-2)
+
+
+def test_mxfp8_scaled_mm_epilogue_reads_mixed_order_large_aux_tuple_lists():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_scaled_mm_epilogue
+
+    M, N, A_q, B_q, A_sc, B_sc = _make_mxfp8_scaled_mm_inputs(6)
+    row_auxes = tuple(torch.randn(N, device="cuda", dtype=torch.float32) * 0.05 for _ in range(4))
+    col_auxes = tuple(torch.randn(M, device="cuda", dtype=torch.float32) * 0.05 for _ in range(4))
+    tile_auxes = tuple(
+        torch.randn(M, N, device="cuda", dtype=dtype) * 0.05
+        for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.float32)
+    )
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
+        _mixed_aux_stress_epilogue,
+        "mixed_aux_stress",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=(
+            "row",
+            "tile",
+            "col",
+            "row",
+            "col",
+            "tile",
+            "tile",
+            "row",
+            "col",
+            "row",
+            "tile",
+            "col",
+        ),
+        epilogue_rowvec_biases=row_auxes,
+        epilogue_colvec_biases=col_auxes,
+        epilogue_tile_biases=tile_auxes,
+        **config,
+    )
+    ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, out_dtype=torch.float32, **config)
+    expected = (
+        ref
+        + row_auxes[0].float()
+        + tile_auxes[0].float()
+        + col_auxes[0].float()[:, None]
+        - row_auxes[1].float()
+        + col_auxes[1].float()[:, None]
+        - tile_auxes[1].float()
+        + tile_auxes[2].float()
+        + row_auxes[2].float()
+        - col_auxes[2].float()[:, None]
+        + row_auxes[3].float()
+        + tile_auxes[3].float()
+        + col_auxes[3].float()[:, None]
+    )
+    torch.testing.assert_close(out, expected.relu(), atol=2e-1, rtol=5e-2)
 
 
 def test_mxfp8_scaled_mm_epilogue_reads_captured_aux_tensors():
