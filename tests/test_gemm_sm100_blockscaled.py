@@ -34,6 +34,16 @@ def _varlen_affine_epilogue(acc, row_bias, col_scale):
     return cute.where(out > cute.full_like(out, 0), out, cute.full_like(out, 0))
 
 
+def _cast_nonlinear_aux_epilogue(acc, row_bias, col_scale, tile_bias):
+    out = (
+        (acc.to(cutlass.BFloat16).to(cutlass.Float32) + row_bias) * col_scale
+        + tile_bias
+    )
+    zero = cute.full_like(out, 0)
+    abs_out = cute.where(out < zero, -out, out)
+    return cute.where(out > zero, out, abs_out * cute.full_like(out, 0.25))
+
+
 def _dequant_nvfp4(q_packed, scale, logical_k):
     codes_lo = (q_packed & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
     codes_hi = ((q_packed >> 4) & 0x0F).view(*q_packed.shape[:-1], logical_k // 2)
@@ -664,6 +674,83 @@ def test_mxfp8_scaled_mm_epilogue_reuses_interface_scale_layout():
     )
     ref = mxfp8_gemm(A_q, B_q, A_sc, B_sc, **config)
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def test_mxfp8_scaled_mm_epilogue_matches_dequant_reference_with_nonunit_scales():
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import (
+        mxfp8_gemm_ref,
+        mxfp8_quantize,
+        mxfp8_scaled_mm_epilogue,
+    )
+
+    M, N, K = 128, 128, 256
+    torch.manual_seed(9)
+    A_hp = torch.testing.make_tensor(
+        M,
+        K,
+        device="cuda",
+        dtype=torch.bfloat16,
+        low=-3.0,
+        high=3.0,
+    )
+    W_hp = torch.testing.make_tensor(
+        N,
+        K,
+        device="cuda",
+        dtype=torch.bfloat16,
+        low=-3.0,
+        high=3.0,
+    )
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    assert (A_sc.view(torch.uint8) != 127).any()
+    assert (W_sc.view(torch.uint8) != 127).any()
+    B_q, B_sc = W_q.mT, W_sc.mT
+    row_bias = torch.testing.make_tensor(
+        N,
+        device="cuda",
+        dtype=torch.float32,
+        low=-0.5,
+        high=0.5,
+    )
+    col_scale = torch.testing.make_tensor(
+        M,
+        device="cuda",
+        dtype=torch.float32,
+        low=-0.5,
+        high=0.5,
+    )
+    tile_bias = torch.testing.make_tensor(
+        M,
+        N,
+        device="cuda",
+        dtype=torch.float32,
+        low=-0.5,
+        high=0.5,
+    )
+    config = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    out = mxfp8_scaled_mm_epilogue(
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
+        _cast_nonlinear_aux_epilogue,
+        "mxfp8_cast_nonlinear_nonunit",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col", "tile"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+        epilogue_tile_biases=(tile_bias,),
+        **config,
+    )
+    ref = mxfp8_gemm_ref(A_q, B_q, A_sc, B_sc, out_dtype=torch.float32)
+    expected_raw = (
+        (ref.to(torch.bfloat16).float() + row_bias) * col_scale[:, None] + tile_bias
+    )
+    expected = torch.where(expected_raw > 0, expected_raw, expected_raw.abs() * 0.25)
+    torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
 
 
 def test_nvfp4_scaled_mm_epilogue_reuses_interface_scale_layout():
