@@ -469,6 +469,101 @@ def mxfp8_scaled_mm_epilogue(
     return out
 
 
+def _mxfp8_varlen_m_scales_to_kernel_layout(
+    A_scale: Tensor,
+    B_scale: Tensor,
+    total_m: int,
+    n: int,
+    k: int,
+    offs: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if A_scale.dim() == 4 and B_scale.dim() == 4:
+        return A_scale, B_scale
+    sf_k = k // _MXFP8_SF_VEC_SIZE
+    rk = ceil_div(sf_k, 4)
+    groups = offs.numel()
+    total_padded_rm = ceil_div(total_m, 128) + groups - 1
+    A_kernel_scale = torch.zeros(
+        1,
+        total_padded_rm,
+        rk,
+        512,
+        dtype=A_scale.dtype,
+        device=A_scale.device,
+    )
+    offset = 0
+    flat_A_scale = A_scale.contiguous().view(-1)
+    prev_end = 0
+    for group_idx, end in enumerate(offs.detach().cpu().tolist()):
+        group_m = end - prev_end
+        src_rm = ceil_div(group_m, 128)
+        chunk_size = src_rm * rk * 512
+        dst_rm = prev_end // 128 + group_idx
+        if chunk_size:
+            A_kernel_scale[0, dst_rm : dst_rm + src_rm] = flat_A_scale[
+                offset : offset + chunk_size
+            ].view(src_rm, rk, 512)
+        offset += chunk_size
+        prev_end = end
+    rn = ceil_div(n, 128)
+    B_kernel_scale = B_scale.contiguous().view(groups, rn, rk, 512)
+    return A_kernel_scale, B_kernel_scale
+
+
+def _mxfp8_varlen_k_scales_to_kernel_layout(
+    A_scale: Tensor,
+    B_scale: Tensor,
+    m: int,
+    n: int,
+    total_k: int,
+    offs: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if A_scale.dim() == 4 and B_scale.dim() == 4:
+        return A_scale, B_scale
+    groups = offs.numel()
+    total_padded_rk = ceil_div(total_k, 128) + groups - 1
+    rm = ceil_div(m, 128)
+    rn = ceil_div(n, 128)
+    A_kernel_scale = torch.zeros(
+        1,
+        rm,
+        total_padded_rk,
+        512,
+        dtype=A_scale.dtype,
+        device=A_scale.device,
+    )
+    B_kernel_scale = torch.zeros(
+        1,
+        rn,
+        total_padded_rk,
+        512,
+        dtype=B_scale.dtype,
+        device=B_scale.device,
+    )
+    flat_A_scale = A_scale.contiguous().view(-1)
+    flat_B_scale = B_scale.contiguous().view(-1)
+    offset_A = 0
+    offset_B = 0
+    prev_end = 0
+    for group_idx, end in enumerate(offs.detach().cpu().tolist()):
+        group_k = end - prev_end
+        rk = ceil_div(group_k // _MXFP8_SF_VEC_SIZE, 4)
+        dst_rk = prev_end // 128 + group_idx
+        a_chunk_size = rm * rk * 512
+        b_chunk_size = rn * rk * 512
+        if rk:
+            A_kernel_scale[0, :, dst_rk : dst_rk + rk] = flat_A_scale[
+                offset_A : offset_A + a_chunk_size
+            ].view(rm, rk, 512)
+            B_kernel_scale[0, :, dst_rk : dst_rk + rk] = flat_B_scale[
+                offset_B : offset_B + b_chunk_size
+            ].view(rn, rk, 512)
+        offset_A += a_chunk_size
+        offset_B += b_chunk_size
+        prev_end = end
+    return A_kernel_scale, B_kernel_scale
+
+
 def mxfp8_varlen_m_scaled_mm_epilogue(
     A: Tensor,
     B: Tensor,
@@ -481,9 +576,12 @@ def mxfp8_varlen_m_scaled_mm_epilogue(
     *,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    epilogue_args: tuple[Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
     epilogue_rowvec_biases: tuple[Tensor, ...] = (),
     epilogue_colvec_biases: tuple[Tensor, ...] = (),
+    tuned: bool = False,
+    epilogue_source: str | None = None,
 ) -> Tensor:
     assert A.dim() == 2, f"varlen-M A must be (total_m, k), got {tuple(A.shape)}"
     assert B.dim() == 3, f"varlen-M B must be (n, k, groups), got {tuple(B.shape)}"
@@ -494,10 +592,23 @@ def mxfp8_varlen_m_scaled_mm_epilogue(
     n, k_b, groups = B.shape
     assert k == k_b
     assert offs.numel() == groups
+    A_scale, B_scale = _mxfp8_varlen_m_scales_to_kernel_layout(
+        A_scale, B_scale, total_m, n, k, offs
+    )
     out = torch.empty(total_m, n, dtype=out_dtype, device=A.device)
     if mma_tiler_mn is None or cluster_shape_mn is None:
         mma_tiler_mn = mma_tiler_mn or (128, 128)
         cluster_shape_mn = cluster_shape_mn or (1, 1)
+    if epilogue_args:
+        epilogue_rowvec_biases = tuple(
+            tensor for tensor, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "row"
+        )
+        epilogue_colvec_biases = tuple(
+            tensor for tensor, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "col"
+        )
+        epilogue_arg_kinds = tuple(
+            kind for kind in epilogue_arg_kinds if kind in ("row", "col")
+        )
     row_auxes = tuple(
         tensor.expand(groups, n).contiguous() if tensor.ndim == 1 else tensor
         for tensor in epilogue_rowvec_biases
@@ -549,9 +660,12 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
     *,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    epilogue_args: tuple[Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
     epilogue_rowvec_biases: tuple[Tensor, ...] = (),
     epilogue_colvec_biases: tuple[Tensor, ...] = (),
+    tuned: bool = False,
+    epilogue_source: str | None = None,
 ) -> Tensor:
     assert A.dim() == 2 and B.dim() == 2
     assert offs.dtype is torch.int32, f"offs must be int32, got {offs.dtype}"
@@ -561,10 +675,23 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
     n, total_k_b = B.shape
     assert total_k == total_k_b
     groups = offs.numel()
+    A_scale, B_scale = _mxfp8_varlen_k_scales_to_kernel_layout(
+        A_scale, B_scale, m, n, total_k, offs
+    )
     out = torch.empty(groups, m, n, dtype=out_dtype, device=A.device).permute(1, 2, 0)
     if mma_tiler_mn is None or cluster_shape_mn is None:
         mma_tiler_mn = mma_tiler_mn or (128, 128)
         cluster_shape_mn = cluster_shape_mn or (1, 1)
+    if epilogue_args:
+        epilogue_rowvec_biases = tuple(
+            tensor for tensor, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "row"
+        )
+        epilogue_colvec_biases = tuple(
+            tensor for tensor, kind in zip(epilogue_args, epilogue_arg_kinds) if kind == "col"
+        )
+        epilogue_arg_kinds = tuple(
+            kind for kind in epilogue_arg_kinds if kind in ("row", "col")
+        )
     runner = compile_blockscaled_gemm_tvm_ffi(
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,

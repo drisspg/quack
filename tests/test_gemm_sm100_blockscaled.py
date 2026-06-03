@@ -1324,6 +1324,149 @@ def test_blockscaled_mxfp8_varlen_m_epilogue_reads_aux_tensors():
     torch.testing.assert_close(out, expected, atol=2e-1, rtol=5e-2)
 
 
+def _compact_varlen_m_a_scale(kernel_scale, seqlens_m):
+    chunks = []
+    offset = 0
+    for group_idx, group_m in enumerate(seqlens_m):
+        src_rm = (group_m + 127) // 128
+        dst_rm = offset // 128 + group_idx
+        chunks.append(kernel_scale[0, dst_rm : dst_rm + src_rm].reshape(-1))
+        offset += group_m
+    return torch.cat(chunks)
+
+
+def _compact_varlen_k_scale(kernel_scale, seqlens_k):
+    chunks = []
+    offset = 0
+    for group_idx, group_k in enumerate(seqlens_k):
+        rk = ((group_k // 32) + 3) // 4
+        dst_rk = offset // 128 + group_idx
+        chunks.append(kernel_scale[0, :, dst_rk : dst_rk + rk].reshape(-1))
+        offset += group_k
+    return torch.cat(chunks)
+
+
+def test_blockscaled_mxfp8_varlen_m_epilogue_accepts_public_compact_scales():
+    _skip_if_not_sm100()
+    seqlens_m = [100, 200, 150]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    sf_vec = 32
+    torch.manual_seed(17)
+    _, _, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
+        create_blockscaled_varlen_m_operands(
+            num_experts,
+            0,
+            n,
+            k,
+            sf_vec,
+            seqlens_m=seqlens_m,
+            b_major="k",
+        )
+    )
+    row_bias = torch.testing.make_tensor(
+        num_experts,
+        n,
+        dtype=torch.float32,
+        device="cuda",
+        low=-0.1,
+        high=0.1,
+    )
+    col_scale = torch.testing.make_tensor(
+        sum(seqlens_m),
+        dtype=torch.float32,
+        device="cuda",
+        low=-0.1,
+        high=0.1,
+    )
+    from quack.gemm_blockscaled_interface import mxfp8_varlen_m_scaled_mm_epilogue
+
+    expected = mxfp8_varlen_m_scaled_mm_epilogue(
+        mA,
+        mB,
+        a_sc_contig,
+        b_sc_contig,
+        cu_seqlens_m[1:],
+        _varlen_affine_epilogue,
+        "varlen_m_compact_expected",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+    actual = mxfp8_varlen_m_scaled_mm_epilogue(
+        mA,
+        mB,
+        _compact_varlen_m_a_scale(a_sc_contig, seqlens_m),
+        b_sc_contig.reshape(num_experts, -1),
+        cu_seqlens_m[1:],
+        _varlen_affine_epilogue,
+        "varlen_m_compact_actual",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_blockscaled_mxfp8_varlen_k_epilogue_accepts_public_compact_scales():
+    _skip_if_not_sm100()
+    seqlens_k = [96, 160, 128]
+    num_experts = len(seqlens_k)
+    m, n = 256, 256
+    sf_vec = 32
+    torch.manual_seed(18)
+    _, _, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
+        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
+    )
+    row_bias = torch.testing.make_tensor(
+        num_experts,
+        n,
+        dtype=torch.float32,
+        device="cuda",
+        low=-1.0,
+        high=1.0,
+    )
+    col_scale = torch.testing.make_tensor(
+        num_experts,
+        m,
+        dtype=torch.float32,
+        device="cuda",
+        low=-1.0,
+        high=1.0,
+    )
+    from quack.gemm_blockscaled_interface import mxfp8_varlen_k_scaled_mm_epilogue
+
+    expected = mxfp8_varlen_k_scaled_mm_epilogue(
+        mA,
+        mB,
+        a_sc_contig,
+        b_sc_contig,
+        cu_seqlens_k[1:],
+        _varlen_affine_epilogue,
+        "varlen_k_compact_expected",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+    actual = mxfp8_varlen_k_scaled_mm_epilogue(
+        mA,
+        mB,
+        _compact_varlen_k_scale(a_sc_contig, seqlens_k),
+        _compact_varlen_k_scale(b_sc_contig, seqlens_k),
+        cu_seqlens_k[1:],
+        _varlen_affine_epilogue,
+        "varlen_k_compact_actual",
+        out_dtype=torch.float32,
+        epilogue_arg_kinds=("row", "col"),
+        epilogue_rowvec_biases=(row_bias,),
+        epilogue_colvec_biases=(col_scale,),
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_blockscaled_mxfp8_varlen_k_epilogue_reads_aux_tensors():
     _skip_if_not_sm100()
     seqlens_k = [96, 160, 128]
