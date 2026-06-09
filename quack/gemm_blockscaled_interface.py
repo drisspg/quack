@@ -378,6 +378,7 @@ def mxfp8_scaled_mm_epilogue(
     epilogue_key: str,
     out_dtype: torch.dtype = torch.bfloat16,
     *,
+    out: Optional[Tensor] = None,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     epilogue_arg_kinds: tuple[str, ...] = (),
@@ -402,7 +403,9 @@ def mxfp8_scaled_mm_epilogue(
         sf_dtype_cutlass,
     ) = _to_kernel_layout(A, B, A_scale, B_scale)
     out_shape = (m, n) if was_2d else (l, m, n)
-    out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    if out is None:
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    assert tuple(out.shape) == out_shape, f"out shape {tuple(out.shape)} != expected {out_shape}"
     mD = (out.unsqueeze(0) if was_2d else out).permute(1, 2, 0)
     if mma_tiler_mn is None or cluster_shape_mn is None:
         if (
@@ -574,6 +577,7 @@ def mxfp8_varlen_m_scaled_mm_epilogue(
     epilogue_key: str,
     out_dtype: torch.dtype = torch.bfloat16,
     *,
+    out: Optional[Tensor] = None,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     epilogue_args: tuple[Tensor, ...] = (),
@@ -595,7 +599,11 @@ def mxfp8_varlen_m_scaled_mm_epilogue(
     A_scale, B_scale = _mxfp8_varlen_m_scales_to_kernel_layout(
         A_scale, B_scale, total_m, n, k, offs
     )
-    out = torch.empty(total_m, n, dtype=out_dtype, device=A.device)
+    if out is None:
+        out = torch.empty(total_m, n, dtype=out_dtype, device=A.device)
+    assert tuple(out.shape) == (total_m, n), (
+        f"out shape {tuple(out.shape)} != expected {(total_m, n)}"
+    )
     if mma_tiler_mn is None or cluster_shape_mn is None:
         mma_tiler_mn = mma_tiler_mn or (128, 128)
         cluster_shape_mn = cluster_shape_mn or (1, 1)
@@ -658,6 +666,7 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
     epilogue_key: str,
     out_dtype: torch.dtype = torch.bfloat16,
     *,
+    out: Optional[Tensor] = None,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     epilogue_args: tuple[Tensor, ...] = (),
@@ -678,7 +687,16 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
     A_scale, B_scale = _mxfp8_varlen_k_scales_to_kernel_layout(
         A_scale, B_scale, m, n, total_k, offs
     )
-    out = torch.empty(groups, m, n, dtype=out_dtype, device=A.device).permute(1, 2, 0)
+    if out is None:
+        out = torch.empty(groups, m, n, dtype=out_dtype, device=A.device)
+    if tuple(out.shape) == (groups, m, n):
+        kernel_out = out.permute(1, 2, 0)
+    elif tuple(out.shape) == (m, n, groups):
+        kernel_out = out
+    else:
+        raise AssertionError(
+            f"out shape {tuple(out.shape)} != expected {(groups, m, n)} or {(m, n, groups)}"
+        )
     if mma_tiler_mn is None or cluster_shape_mn is None:
         mma_tiler_mn = mma_tiler_mn or (128, 128)
         cluster_shape_mn = cluster_shape_mn or (1, 1)
@@ -701,7 +719,7 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
         cluster_shape_mn,
         A,
         B,
-        out,
+        kernel_out,
         A_scale,
         B_scale,
         varlen_k=True,
@@ -716,14 +734,14 @@ def mxfp8_varlen_k_scaled_mm_epilogue(
     runner(
         A,
         B,
-        out,
+        kernel_out,
         A_scale,
         B_scale,
         row_auxes=epilogue_rowvec_biases,
         col_auxes=epilogue_colvec_biases,
         cu_seqlens=cu_seqlens,
     )
-    return out.permute(2, 0, 1).contiguous()
+    return out
 
 
 def mxfp8_gemm(

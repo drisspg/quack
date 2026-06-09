@@ -60,6 +60,7 @@ def _grouped_mm_3d_2d_epilogue(
     out_dtype,
     tuned: bool,
     epilogue_source: str | None,
+    out: Tensor | None = None,
 ) -> Tensor:
     config, covered_n = _cached_varlen_n_config(a, b, offs)
     if covered_n > b.shape[-1]:
@@ -81,13 +82,15 @@ def _grouped_mm_3d_2d_epilogue(
             cu_seqlens_n=cu_seqlens_n,
             out_dtype=out_dtype,
             postact_dtype=postact_dtype,
+            postact_out=out,
         )
         return out
-    out = torch.empty(
-        (a.shape[-2], b.shape[-1]),
-        device=a.device,
-        dtype=postact_dtype,
-    )
+    if out is None:
+        out = torch.empty(
+            (a.shape[-2], b.shape[-1]),
+            device=a.device,
+            dtype=postact_dtype,
+        )
     gemm_act_dispatch(
         a,
         b.mT,
@@ -193,6 +196,7 @@ def gemm_epilogue(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     out_dtype=None,
+    out: Tensor | None = None,
     offs: Tensor | None = None,
     epilogue_args: tuple[Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
@@ -280,6 +284,7 @@ def gemm_epilogue(
                 out_dtype,
                 tuned,
                 epilogue_source,
+                out,
             )
         cu_seqlens = _cu_seqlens_from_offsets(offs)
         if a.dim() == 2 and b.dim() == 3:
@@ -306,6 +311,7 @@ def gemm_epilogue(
             cu_seqlens_n=cu_seqlens_n,
             out_dtype=out_dtype,
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
+            postact_out=out,
             main_output_transform=main_output_transform,
             main_output_transform_group=main_output_transform_group,
             concat_layout=concat_layout,
@@ -364,6 +370,7 @@ def gemm_epilogue(
             tensor_epilogue_source=epilogue_source,
             out_dtype=out_dtype,
             postact_dtype=a.dtype if out_dtype is None else out_dtype,
+            postact_out=out,
             store_preact=False,
             main_output_transform=main_output_transform,
             main_output_transform_group=main_output_transform_group,
@@ -412,6 +419,7 @@ def gemm_epilogue(
             epilogue_fn,
             epilogue_key,
             out_dtype=a.dtype if out_dtype is None else out_dtype,
+            out=out,
             epilogue_arg_kinds=epilogue_arg_kinds,
             epilogue_rowvec_biases=row_auxes,
             epilogue_colvec_biases=col_auxes,
@@ -453,8 +461,8 @@ def gemm_epilogue(
         tensor_epilogue_tile_biases=tile_auxes,
         alpha=alpha,
         beta=beta,
-        preact_out=None,
-        postact_out=aux_out,
+        preact_out=out if aux_out is not None else None,
+        postact_out=aux_out if aux_out is not None else out,
         out_dtype=out_dtype,
         postact_dtype=aux_out.dtype if aux_out is not None else postact_dtype,
         store_preact=aux_out is not None,
