@@ -32,7 +32,7 @@ from quack.rounding import RoundingMode, epilogue_sr_seed
 
 
 class GemmSymmetricMixin(GemmActMixin):
-    def get_scheduler_class(self, varlen_m: bool = False):
+    def get_scheduler_class(self, varlen_m: bool = False, varlen_n: bool = False):
         return TriangularTileScheduler
 
     @cute.jit
@@ -323,6 +323,17 @@ def _compile_gemm_symmetric(
     epi_args = GemmCls.EpilogueArguments(
         mAuxOut,
         act_fn,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
     )
@@ -436,6 +447,17 @@ def gemm_symmetric(
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
         None,  # act_fn is Constexpr, baked in at compile time
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
         rounding_mode=None,
